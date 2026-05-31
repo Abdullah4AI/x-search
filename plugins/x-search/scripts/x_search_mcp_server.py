@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import html
 import json
 import os
 import re
@@ -39,6 +40,7 @@ XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:acces
 XAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 XAI_OAUTH_REDIRECT_PORT = 56121
 XAI_OAUTH_REDIRECT_PATH = "/callback"
+XAI_OAUTH_START_PATH = "/start"
 DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 75
 DEFAULT_X_SEARCH_RETRIES = 1
@@ -654,12 +656,19 @@ def _oauth_build_authorize_url(
 
 
 def _callback_cors_origin(origin: Optional[str]) -> str:
-    allowed = {"https://accounts.x.ai", "https://auth.x.ai"}
-    return origin if origin in allowed else ""
+    if origin == "https://accounts.x.ai":
+        return "https://accounts.x.ai"
+    if origin == "https://auth.x.ai":
+        return "https://auth.x.ai"
+    return ""
 
 
-def _make_callback_handler(expected_path: str) -> Tuple[type[BaseHTTPRequestHandler], Dict[str, Any]]:
+def _make_callback_handler(
+    expected_path: str,
+    start_path: str,
+) -> Tuple[type[BaseHTTPRequestHandler], Dict[str, Any]]:
     result: Dict[str, Any] = {
+        "authorize_url": None,
         "code": None,
         "state": None,
         "error": None,
@@ -685,6 +694,35 @@ def _make_callback_handler(expected_path: str) -> Tuple[type[BaseHTTPRequestHand
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == start_path:
+                with result_lock:
+                    authorize_url = result.get("authorize_url")
+                if not authorize_url:
+                    self.send_response(503)
+                    self._maybe_write_cors_headers()
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body><h1>X Search sign-in is not ready.</h1></body></html>"
+                    )
+                    return
+
+                escaped_url = html.escape(str(authorize_url), quote=True)
+                body = (
+                    "<html><head>"
+                    f'<meta http-equiv="refresh" content="0; url={escaped_url}">'
+                    "</head><body>"
+                    "<h1>Continue to xAI sign-in.</h1>"
+                    f'<p><a href="{escaped_url}">Open xAI authorization</a></p>'
+                    "</body></html>"
+                )
+                self.send_response(200)
+                self._maybe_write_cors_headers()
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body.encode("utf-8"))
+                return
+
             if parsed.path != expected_path:
                 self.send_response(404)
                 self.end_headers()
@@ -736,8 +774,8 @@ def _make_callback_handler(expected_path: str) -> Tuple[type[BaseHTTPRequestHand
 
 def _start_callback_server(
     preferred_port: int = XAI_OAUTH_REDIRECT_PORT,
-) -> Tuple[ThreadingHTTPServer, threading.Thread, Dict[str, Any], str]:
-    handler_cls, result = _make_callback_handler(XAI_OAUTH_REDIRECT_PATH)
+) -> Tuple[ThreadingHTTPServer, threading.Thread, Dict[str, Any], str, str]:
+    handler_cls, result = _make_callback_handler(XAI_OAUTH_REDIRECT_PATH, XAI_OAUTH_START_PATH)
 
     class _ReuseHTTPServer(ThreadingHTTPServer):
         allow_reuse_address = True
@@ -762,13 +800,14 @@ def _start_callback_server(
 
     actual_port = int(server.server_address[1])
     redirect_uri = f"http://{XAI_OAUTH_REDIRECT_HOST}:{actual_port}{XAI_OAUTH_REDIRECT_PATH}"
+    start_uri = f"http://{XAI_OAUTH_REDIRECT_HOST}:{actual_port}{XAI_OAUTH_START_PATH}"
     thread = threading.Thread(
         target=server.serve_forever,
         kwargs={"poll_interval": 0.1},
         daemon=True,
     )
     thread.start()
-    return server, thread, result, redirect_uri
+    return server, thread, result, redirect_uri, start_uri
 
 
 def _wait_for_callback(
@@ -888,7 +927,7 @@ def _run_xai_oauth_login(
     open_browser: bool,
 ) -> Dict[str, Any]:
     discovery = _oauth_discovery(timeout_seconds)
-    server, thread, callback_result, redirect_uri = _start_callback_server()
+    server, thread, callback_result, redirect_uri, start_uri = _start_callback_server()
     try:
         code_verifier = _oauth_pkce_code_verifier()
         code_challenge = _oauth_pkce_code_challenge(code_verifier)
@@ -901,21 +940,22 @@ def _run_xai_oauth_login(
             state=state,
             nonce=nonce,
         )
+        callback_result["authorize_url"] = authorize_url
 
-        print("Open this URL to authorize X Search with xAI:", file=sys.stderr)
-        print(authorize_url, file=sys.stderr)
-        print(f"Waiting for callback on {redirect_uri}", file=sys.stderr)
+        print("Open this local URL to authorize X Search with xAI:", file=sys.stderr)
+        print(start_uri, file=sys.stderr)
+        print("Waiting for the local xAI callback.", file=sys.stderr)
 
         browser_opened = False
         if open_browser:
             try:
-                browser_opened = bool(webbrowser.open(authorize_url))
+                browser_opened = bool(webbrowser.open(start_uri))
             except Exception:
                 browser_opened = False
             if browser_opened:
                 print("Browser opened for xAI authorization.", file=sys.stderr)
             else:
-                print("Could not open a browser automatically; use the URL above.", file=sys.stderr)
+                print("Could not open a browser automatically; use the local URL above.", file=sys.stderr)
 
         callback = _wait_for_callback(
             server,
@@ -1752,7 +1792,7 @@ def _run_cli_auth(argv: List[str]) -> int:
     try:
         if force:
             _delete_auth_store()
-        result = x_search_auth_tool(
+        x_search_auth_tool(
             {
                 "allow_redirect": True,
                 "open_browser": not no_browser,
@@ -1763,7 +1803,18 @@ def _run_cli_auth(argv: List[str]) -> int:
     except XSearchError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(json.dumps(result, indent=2))
+    print(
+        json.dumps(
+            {
+                "success": True,
+                "provider": "xai",
+                "tool": "x_search_auth",
+                "authenticated": True,
+                "message": "X Search authentication completed.",
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

@@ -502,6 +502,115 @@ class XSearchToolTests(unittest.TestCase):
 
 
 class OAuthResolutionTests(unittest.TestCase):
+    def test_callback_cors_origin_returns_only_fixed_origins(self):
+        self.assertEqual(
+            server._callback_cors_origin("https://accounts.x.ai"),
+            "https://accounts.x.ai",
+        )
+        self.assertEqual(
+            server._callback_cors_origin("https://auth.x.ai"),
+            "https://auth.x.ai",
+        )
+        self.assertEqual(server._callback_cors_origin("https://evil.example"), "")
+        self.assertEqual(
+            server._callback_cors_origin("https://accounts.x.ai\r\nX-Test: injected"),
+            "",
+        )
+
+    def test_oauth_login_logs_only_local_start_url(self):
+        class FakeServer:
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        class FakeThread:
+            def join(self, timeout=None):
+                del timeout
+
+        callback_result = {}
+        stderr = io.StringIO()
+        start_uri = "http://127.0.0.1:56121/start"
+
+        def fake_wait(server_arg, thread_arg, result_arg, timeout_seconds):
+            self.assertIs(result_arg, callback_result)
+            self.assertEqual(timeout_seconds, 45)
+            return {"code": "auth-code", "state": "state-token"}
+
+        with mock.patch.object(
+            server,
+            "_oauth_discovery",
+            return_value={
+                "authorization_endpoint": "https://auth.x.ai/oauth2/authorize",
+                "token_endpoint": "https://auth.x.ai/oauth2/token",
+            },
+        ), mock.patch.object(
+            server,
+            "_start_callback_server",
+            return_value=(
+                FakeServer(),
+                FakeThread(),
+                callback_result,
+                "http://127.0.0.1:56121/callback",
+                start_uri,
+            ),
+        ), mock.patch.object(
+            server.uuid,
+            "uuid4",
+            side_effect=[mock.Mock(hex="state-token"), mock.Mock(hex="nonce-token")],
+        ), mock.patch.object(
+            server.webbrowser,
+            "open",
+            return_value=True,
+        ) as browser_open, mock.patch.object(
+            server,
+            "_wait_for_callback",
+            side_effect=fake_wait,
+        ), mock.patch.object(
+            server,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "access", "refresh_token": "refresh"},
+        ), mock.patch.object(
+            server,
+            "_store_oauth_payload",
+            return_value={"base_url": "https://api.x.ai/v1"},
+        ), mock.patch.object(sys, "stderr", stderr):
+            result = server._run_xai_oauth_login(timeout_seconds=45, open_browser=True)
+
+        self.assertEqual(result["base_url"], "https://api.x.ai/v1")
+        browser_open.assert_called_once_with(start_uri)
+        self.assertIn("state-token", callback_result["authorize_url"])
+        self.assertIn(start_uri, stderr.getvalue())
+        self.assertNotIn("state-token", stderr.getvalue())
+        self.assertNotIn("nonce-token", stderr.getvalue())
+        self.assertNotIn("https://auth.x.ai/oauth2/authorize", stderr.getvalue())
+
+    def test_cli_auth_output_excludes_tool_credentials(self):
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            server,
+            "x_search_auth_tool",
+            return_value={
+                "success": True,
+                "provider": "xai",
+                "tool": "x_search_auth",
+                "authenticated": True,
+                "access_token": "secret-access",
+                "refresh_token": "secret-refresh",
+                "message": "ok",
+            },
+        ), mock.patch.object(sys, "stdout", stdout):
+            exit_code = server._run_cli_auth(["--no-browser"])
+
+        self.assertEqual(exit_code, 0)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["message"], "X Search authentication completed.")
+        self.assertNotIn("access_token", stdout.getvalue())
+        self.assertNotIn("refresh_token", stdout.getvalue())
+
     def test_refresh_discovers_and_persists_missing_token_endpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth_home = Path(tmp)
