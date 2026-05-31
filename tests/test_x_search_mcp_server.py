@@ -17,6 +17,17 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import x_search_mcp_server as server  # noqa: E402
 
 
+class PluginPackageTests(unittest.TestCase):
+    def test_mcp_server_config_launches_from_plugin_root(self):
+        config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        server_config = config["mcpServers"]["x-search"]
+
+        self.assertEqual(server_config["command"], "python3")
+        self.assertEqual(server_config["args"], ["-u", "scripts/x_search_mcp_server.py"])
+        self.assertEqual(server_config["cwd"], ".")
+        self.assertEqual(server_config["env"], {})
+
+
 class FakeHTTPResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -728,6 +739,42 @@ class HttpTransportTests(unittest.TestCase):
 
         self.assertIn("TLS certificate verification failed", str(ctx.exception))
         self.assertIn("X_SEARCH_CA_BUNDLE", str(ctx.exception))
+
+    def test_urlopen_retries_with_next_ca_bundle_after_tls_error(self):
+        captured_contexts = []
+
+        def fake_urlopen(request, timeout, context=None):
+            del request, timeout
+            captured_contexts.append(context)
+            if len(captured_contexts) == 1:
+                raise urllib.error.URLError(
+                    ssl.SSLCertVerificationError("certificate verify failed")
+                )
+            return FakeHTTPResponse({"output_text": "ok"})
+
+        with mock.patch.object(
+            server,
+            "_ca_bundle_candidates",
+            return_value=["/tmp/stale.pem", "/tmp/system.pem"],
+        ), mock.patch.object(
+            server,
+            "_https_context",
+            side_effect=lambda cafile=None: f"context:{cafile or 'default'}",
+        ), mock.patch.object(
+            server.urllib.request,
+            "urlopen",
+            side_effect=fake_urlopen,
+        ):
+            response = server._urlopen(
+                urllib.request.Request("https://api.x.ai/v1/responses"),
+                33,
+            )
+
+        self.assertEqual(json.loads(response.read().decode("utf-8"))["output_text"], "ok")
+        self.assertEqual(
+            captured_contexts,
+            ["context:/tmp/stale.pem", "context:/tmp/system.pem"],
+        )
 
     def test_default_config_favors_faster_search(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(

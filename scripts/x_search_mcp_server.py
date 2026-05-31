@@ -28,7 +28,7 @@ import webbrowser
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
@@ -42,6 +42,13 @@ XAI_OAUTH_REDIRECT_PATH = "/callback"
 DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 75
 DEFAULT_X_SEARCH_RETRIES = 1
+DEFAULT_CA_BUNDLE_PATHS = (
+    "/etc/ssl/cert.pem",
+    "/opt/homebrew/etc/ca-certificates/cert.pem",
+    "/usr/local/etc/openssl@3/cert.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+)
 XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 MAX_HANDLES = 10
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -456,55 +463,79 @@ def _read_json_response(response: Any, limit: int = MAX_RESPONSE_BYTES) -> Dict[
     return payload
 
 
-def _ca_bundle_path() -> Optional[str]:
+def _append_existing_ca_bundle(candidates: List[Optional[str]], raw_path: str) -> None:
+    path = Path(str(raw_path)).expanduser()
+    if path.is_file():
+        candidates.append(str(path))
+
+
+def _ca_bundle_candidates() -> List[Optional[str]]:
     configured = str(_env_value("X_SEARCH_CA_BUNDLE") or "").strip()
+    candidates: List[Optional[str]] = []
     if configured:
-        path = Path(configured).expanduser()
-        if path.is_file():
-            return str(path)
-        raise XSearchError(f"X_SEARCH_CA_BUNDLE does not point to a file: {path}")
+        _append_existing_ca_bundle(candidates, configured)
+
+    for raw_path in DEFAULT_CA_BUNDLE_PATHS:
+        _append_existing_ca_bundle(candidates, raw_path)
 
     try:
         import certifi  # type: ignore
 
-        certifi_path = Path(str(certifi.where())).expanduser()
-        if certifi_path.is_file():
-            return str(certifi_path)
+        _append_existing_ca_bundle(candidates, str(certifi.where()))
     except Exception:
         pass
-    return None
+
+    candidates.append(None)
+    unique_candidates: List[Optional[str]] = []
+    seen = set()
+    for candidate in candidates:
+        key = candidate or ""
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(candidate)
+    return unique_candidates
 
 
-def _https_context() -> ssl.SSLContext:
-    cafile = _ca_bundle_path()
+def _https_context(cafile: Optional[str] = None) -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
 
 
+def _is_tls_verification_error(exc: BaseException) -> bool:
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, ssl.SSLCertVerificationError) or (
+        isinstance(reason, ssl.SSLError)
+        and "CERTIFICATE_VERIFY_FAILED" in str(reason).upper()
+    )
+
+
+def _tls_failure_message(attempted: Sequence[Optional[str]]) -> str:
+    attempted_labels = [candidate or "default trust store" for candidate in attempted]
+    attempted_text = ", ".join(attempted_labels) if attempted_labels else "default trust store"
+    return (
+        "TLS certificate verification failed while connecting to xAI after trying "
+        f"{attempted_text}. Set X_SEARCH_CA_BUNDLE to a valid CA bundle path, then retry."
+    )
+
+
 def _urlopen(request: urllib.request.Request, timeout_seconds: int) -> Any:
-    try:
-        return urllib.request.urlopen(
-            request,
-            timeout=timeout_seconds,
-            context=_https_context(),
-        )
-    except ssl.SSLCertVerificationError as exc:
-        raise XSearchError(
-            "TLS certificate verification failed while connecting to xAI. "
-            "Install certifi for this Python environment or set X_SEARCH_CA_BUNDLE "
-            "to a valid CA bundle path, then retry."
-        ) from exc
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, ssl.SSLCertVerificationError) or (
-            isinstance(reason, ssl.SSLError)
-            and "CERTIFICATE_VERIFY_FAILED" in str(reason).upper()
-        ):
-            raise XSearchError(
-                "TLS certificate verification failed while connecting to xAI. "
-                "Install certifi for this Python environment or set X_SEARCH_CA_BUNDLE "
-                "to a valid CA bundle path, then retry."
-            ) from exc
-        raise
+    attempted: List[Optional[str]] = []
+    last_tls_error: Optional[BaseException] = None
+    for cafile in _ca_bundle_candidates():
+        attempted.append(cafile)
+        try:
+            return urllib.request.urlopen(
+                request,
+                timeout=timeout_seconds,
+                context=_https_context(cafile),
+            )
+        except (ssl.SSLError, urllib.error.URLError) as exc:
+            if _is_tls_verification_error(exc):
+                last_tls_error = exc
+                continue
+            raise
+    raise XSearchError(_tls_failure_message(attempted)) from last_tls_error
 
 
 def _redact(text: str) -> str:

@@ -13,7 +13,7 @@ its own xAI sign-in flow.
 - xAI citations and inline URL citation extraction
 - `degraded` result flag when filters are active but no citations are returned
 - Precision hint for latest-post questions without a known handle
-- Certifi-backed HTTPS verification, with `X_SEARCH_CA_BUNDLE` override
+- System-CA-backed HTTPS verification, with `X_SEARCH_CA_BUNDLE` override
 - Built-in browser-based xAI OAuth PKCE sign-in with local token storage
 - `XAI_API_KEY` fallback from `~/.codex-x-search/.env` or the process environment
 - Local config through `~/.codex-x-search/config.json` or environment variables
@@ -103,9 +103,10 @@ intentionally use a trusted proxy for API-key traffic, set:
 X_SEARCH_ALLOW_CUSTOM_BASE_URL=1
 ```
 
-HTTPS requests use Python's default trust store with `certifi` when it is
-available. If your Python installation has a broken CA setup, install `certifi`
-for that Python or set `X_SEARCH_CA_BUNDLE` to a valid CA bundle file.
+HTTPS requests first try `X_SEARCH_CA_BUNDLE` when set, then common system CA
+bundle locations, then `certifi`, and finally Python's default trust store. If
+your Python installation still has a broken CA setup, set `X_SEARCH_CA_BUNDLE`
+to a valid CA bundle file.
 
 ## Tool Parameters
 

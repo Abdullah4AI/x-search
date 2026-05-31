@@ -3,8 +3,10 @@
     "x-search": {
       "command": "python3",
       "args": [
+        "-u",
         "scripts/x_search_mcp_server.py"
       ],
+      "cwd": ".",
       "env": {}
     }
   }
