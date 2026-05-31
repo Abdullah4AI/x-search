@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+.env.*
+!.env.example
+auth.json
+.hermes/
+*.pem
+*.key
+*.p12
+*.pfx

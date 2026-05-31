@@ -13,41 +13,48 @@ X Search tool by calling xAI's Responses API with the server-side
 - xAI citations and inline URL citation extraction
 - `degraded` result flag when filters are active but no citations are returned
 - xAI OAuth reuse from `~/.hermes/auth.json`, preferred when available
-- `XAI_API_KEY` fallback from process environment, local `.env`, or `~/.hermes/.env`
-- Config reuse from `~/.hermes/config.yaml` `x_search:` where available
+- `XAI_API_KEY` fallback using Hermes env precedence: `~/.hermes/.env`, then process environment
+- Config reuse from Hermes `load_config().get("x_search")`, with `~/.hermes/config.yaml` parsing as fallback
 
 ## Authentication
 
 The plugin resolves credentials in this order:
 
-1. Hermes xAI OAuth credentials from `~/.hermes/auth.json`
-2. `XAI_API_KEY`
+1. Hermes' own xAI HTTP resolver, when `~/.hermes/hermes-agent` is available
+2. Standalone Hermes-compatible xAI OAuth refresh from `~/.hermes/auth.json`
+3. `XAI_API_KEY` from `~/.hermes/.env`, then process environment
 
-OAuth access tokens are refreshed when possible. To skip Hermes OAuth and force
-the API-key path, set:
+OAuth access tokens are refreshed when possible. To skip Hermes OAuth and force the API-key path, set:
 
 ```bash
 X_SEARCH_DISABLE_HERMES_OAUTH=1
 ```
 
-## Configuration
-
-Environment variables override the Hermes config file:
+To skip importing Hermes' resolver and use the standalone fallback implementation, set:
 
 ```bash
-X_SEARCH_MODEL=grok-4.20-reasoning
-X_SEARCH_TIMEOUT_SECONDS=180
-X_SEARCH_RETRIES=2
-XAI_BASE_URL=https://api.x.ai/v1
+X_SEARCH_DISABLE_HERMES_RESOLVER=1
 ```
 
-The plugin also reads this Hermes-compatible block:
+## Configuration
+
+The x_search model, timeout, and retry settings follow Hermes' `x_search:`
+configuration. The defaults are:
+
+The plugin reads this Hermes-compatible block:
 
 ```yaml
 x_search:
   model: grok-4.20-reasoning
   timeout_seconds: 180
   retries: 2
+```
+
+For safety, `XAI_BASE_URL` must point to an HTTPS `x.ai` host. If you
+intentionally use a trusted proxy for API-key traffic, set:
+
+```bash
+X_SEARCH_ALLOW_CUSTOM_BASE_URL=1
 ```
 
 ## Tool Parameters
@@ -65,3 +72,15 @@ x_search:
 The result is JSON text with `success`, `answer`, `citations`,
 `inline_citations`, `degraded`, `degraded_reason`, `credential_source`, `model`,
 and `query`.
+
+## Validation
+
+Run the local test suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The tests cover the xAI Responses payload shape, filter/date validation,
+degraded-result signaling, Hermes OAuth refresh persistence, and MCP
+`tools/list` / `tools/call` behavior.

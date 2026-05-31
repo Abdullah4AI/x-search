@@ -5,8 +5,8 @@
   "author": {
     "name": "Abdullah Alrashoudi"
   },
-  "homepage": "https://github.com/abdullahalrashoudi/x-search",
-  "repository": "https://github.com/abdullahalrashoudi/x-search",
+  "homepage": "https://github.com/Abdullah4AI/x-search",
+  "repository": "https://github.com/Abdullah4AI/x-search",
   "license": "MIT",
   "keywords": [
     "x",
@@ -29,7 +29,7 @@
       "Interactive",
       "Read"
     ],
-    "websiteURL": "https://github.com/abdullahalrashoudi/x-search",
+    "websiteURL": "https://github.com/Abdullah4AI/x-search",
     "defaultPrompt": [
       "Search X for reactions to a launch",
       "Find recent posts from @xai",
