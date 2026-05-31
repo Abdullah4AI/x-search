@@ -519,6 +519,8 @@ class OAuthResolutionTests(unittest.TestCase):
 
     def test_oauth_login_logs_only_local_start_url(self):
         class FakeServer:
+            server_address = ("127.0.0.1", 56121)
+
             def shutdown(self):
                 pass
 
@@ -553,7 +555,6 @@ class OAuthResolutionTests(unittest.TestCase):
                 FakeThread(),
                 callback_result,
                 "http://127.0.0.1:56121/callback",
-                start_uri,
             ),
         ), mock.patch.object(
             server.uuid,
