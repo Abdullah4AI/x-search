@@ -32,6 +32,22 @@ class FakeHTTPResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class FakeHTTPError(urllib.error.HTTPError):
+    def __init__(self, code, payload):
+        self._body = json.dumps(payload).encode("utf-8")
+        self._reader = io.BytesIO(self._body)
+        super().__init__(
+            url="https://api.x.ai/v1/responses",
+            code=code,
+            msg="HTTP error",
+            hdrs={},
+            fp=None,
+        )
+
+    def read(self, size=-1):
+        return self._reader.read(size)
+
+
 class XSearchToolTests(unittest.TestCase):
     def test_builds_xai_responses_payload(self):
         captured = {}
@@ -114,6 +130,47 @@ class XSearchToolTests(unittest.TestCase):
             result["degraded_reason"],
             "no citations returned despite filters: allowed_x_handles",
         )
+
+    def test_marks_degraded_for_excluded_handle_filter(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", return_value={"output_text": "answer", "citations": []}):
+            result = server.x_search_tool(
+                {"query": "anything", "excluded_x_handles": ["noisy"]}
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["degraded"])
+        self.assertIn("excluded_x_handles", result["degraded_reason"])
+
+    def test_marks_degraded_for_date_range_filter(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", return_value={"output_text": "answer", "citations": []}):
+            result = server.x_search_tool(
+                {
+                    "query": "anything",
+                    "from_date": "2026-05-01",
+                    "to_date": "2026-05-02",
+                }
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["degraded"])
+        self.assertIn("from_date", result["degraded_reason"])
+        self.assertIn("to_date", result["degraded_reason"])
 
     def test_latest_author_query_gets_precision_hint_without_handle_filter(self):
         captured = {}
@@ -239,6 +296,31 @@ class XSearchToolTests(unittest.TestCase):
         self.assertIsNone(filtered["degraded_reason"])
         self.assertEqual(filtered["inline_citations"][0]["url"], "https://x.com/xai/status/1")
 
+    def test_not_degraded_with_top_level_citation(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(
+            server,
+            "_post_json",
+            return_value={
+                "output_text": "answer",
+                "citations": [{"url": "https://x.com/xai/status/1"}],
+            },
+        ):
+            result = server.x_search_tool(
+                {"query": "anything", "allowed_x_handles": ["xai"]}
+            )
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["degraded"])
+        self.assertIsNone(result["degraded_reason"])
+
     def test_allows_future_to_date(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(
             os.environ,
@@ -283,6 +365,33 @@ class XSearchToolTests(unittest.TestCase):
         post_json.assert_not_called()
         resolve_credentials.assert_not_called()
 
+    def test_rejects_malformed_and_inverted_dates_before_http_call(self):
+        invalid_cases = [
+            ({"query": "anything", "from_date": "not-a-date"}, "from_date must be YYYY-MM-DD"),
+            ({"query": "anything", "to_date": "2026/05/01"}, "to_date must be YYYY-MM-DD"),
+            (
+                {
+                    "query": "anything",
+                    "from_date": "2026-05-10",
+                    "to_date": "2026-05-01",
+                },
+                "must be on or before",
+            ),
+        ]
+        for arguments, expected in invalid_cases:
+            with self.subTest(arguments=arguments), mock.patch.object(
+                server,
+                "_post_json",
+            ) as post_json, mock.patch.object(
+                server,
+                "_resolve_xai_credentials",
+            ) as resolve_credentials:
+                with self.assertRaises(server.XSearchError) as ctx:
+                    server.x_search_tool(arguments)
+                self.assertIn(expected, str(ctx.exception))
+                post_json.assert_not_called()
+                resolve_credentials.assert_not_called()
+
     def test_rejects_string_boolean_before_credentials(self):
         with mock.patch.object(server, "_resolve_xai_credentials") as resolve_credentials:
             with self.assertRaises(server.XSearchError) as ctx:
@@ -320,6 +429,64 @@ class XSearchToolTests(unittest.TestCase):
 
         self.assertIn("x_search_auth", str(ctx.exception))
         login.assert_not_called()
+
+    def test_retries_5xx_then_succeeds(self):
+        calls = {"count": 0}
+
+        def fake_post(url, headers, payload, timeout_seconds):
+            del url, headers, payload, timeout_seconds
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise FakeHTTPError(500, {"code": "server_error", "error": "temporary"})
+            return {"output_text": "Recovered", "citations": []}
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "1"},
+        ), mock.patch.object(server, "_post_json", side_effect=fake_post), mock.patch.object(
+            server.time,
+            "sleep",
+        ) as sleep:
+            result = server.x_search_tool({"query": "anything"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["answer"], "Recovered")
+        self.assertEqual(calls["count"], 2)
+        sleep.assert_called_once()
+
+    def test_retries_timeout_then_succeeds(self):
+        calls = {"count": 0}
+
+        def fake_post(url, headers, payload, timeout_seconds):
+            del url, headers, payload, timeout_seconds
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise TimeoutError("timed out")
+            return {"output_text": "Recovered", "citations": []}
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "1"},
+        ), mock.patch.object(server, "_post_json", side_effect=fake_post), mock.patch.object(
+            server.time,
+            "sleep",
+        ) as sleep:
+            result = server.x_search_tool({"query": "anything"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["answer"], "Recovered")
+        self.assertEqual(calls["count"], 2)
+        sleep.assert_called_once()
 
 
 class OAuthResolutionTests(unittest.TestCase):

@@ -1222,19 +1222,23 @@ def _user_agent() -> str:
 
 
 def _http_error_message(exc: urllib.error.HTTPError) -> str:
-    body = _redact(_read_limited(exc, MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip())
     try:
-        payload = json.loads(body)
-    except Exception:
-        payload = None
-    if isinstance(payload, dict):
-        code = str(payload.get("code") or "").strip()
-        error = str(payload.get("error") or payload.get("message") or "").strip()
-        message = error or str(payload)
-        if code and code not in message:
-            message = f"{code}: {message}"
-        return message
-    return body[:500] or str(exc)
+        body = _redact(_read_limited(exc, MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip())
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            code = str(payload.get("code") or "").strip()
+            error = str(payload.get("error") or payload.get("message") or "").strip()
+            message = error or str(payload)
+            if code and code not in message:
+                message = f"{code}: {message}"
+            return message
+        return body[:500] or str(exc)
+    finally:
+        with contextlib.suppress(Exception):
+            exc.close()
 
 
 def _post_json(
