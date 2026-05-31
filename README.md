@@ -12,6 +12,8 @@ its own xAI sign-in flow.
 - `enable_image_understanding` and `enable_video_understanding`
 - xAI citations and inline URL citation extraction
 - `degraded` result flag when filters are active but no citations are returned
+- Precision hint for latest-post questions without a known handle
+- Certifi-backed HTTPS verification, with `X_SEARCH_CA_BUNDLE` override
 - Built-in browser-based xAI OAuth PKCE sign-in with local token storage
 - `XAI_API_KEY` fallback from `~/.codex-x-search/.env` or the process environment
 - Local config through `~/.codex-x-search/config.json` or environment variables
@@ -78,8 +80,8 @@ The x_search model, timeout, and retry settings can be set in
 {
   "x_search": {
     "model": "grok-4.20-reasoning",
-    "timeout_seconds": 180,
-    "retries": 2
+    "timeout_seconds": 75,
+    "retries": 1
   }
 }
 ```
@@ -90,6 +92,7 @@ Environment variables override the config file:
 - `X_SEARCH_TIMEOUT_SECONDS`
 - `X_SEARCH_RETRIES`
 - `X_SEARCH_HOME`
+- `X_SEARCH_CA_BUNDLE`
 - `XAI_API_KEY`
 - `XAI_BASE_URL`
 
@@ -99,6 +102,10 @@ intentionally use a trusted proxy for API-key traffic, set:
 ```bash
 X_SEARCH_ALLOW_CUSTOM_BASE_URL=1
 ```
+
+HTTPS requests use Python's default trust store with `certifi` when it is
+available. If your Python installation has a broken CA setup, install `certifi`
+for that Python or set `X_SEARCH_CA_BUNDLE` to a valid CA bundle file.
 
 ## Tool Parameters
 
@@ -114,7 +121,7 @@ X_SEARCH_ALLOW_CUSTOM_BASE_URL=1
 
 The result is JSON text with `success`, `answer`, `citations`,
 `inline_citations`, `degraded`, `degraded_reason`, `credential_source`, `model`,
-and `query`.
+`query_strategy`, and `query`.
 
 Additional MCP tools:
 
@@ -123,9 +130,9 @@ Additional MCP tools:
 - `x_search_status`: reports whether this user has a local credential
 - `x_search_logout`: removes the stored OAuth token for this user
 
-`x_search` is exposed only after the plugin detects a local OAuth token or
-`XAI_API_KEY`. Until then, `x_search_auth` and `x_search_status` remain
-available so Codex can ask the user to authenticate first.
+`x_search` is always exposed so Codex can find the right tool immediately. If
+credentials are missing, calling it returns an auth-required response that
+points Codex to `x_search_auth` without starting browser sign-in.
 
 ## Validation
 
@@ -136,5 +143,6 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests cover the xAI Responses payload shape, filter/date validation,
-degraded-result signaling, standalone OAuth refresh persistence, browser sign-in
-tool wiring, and MCP `tools/list` / `tools/call` behavior.
+degraded-result signaling, latest-post query hinting, cert-aware HTTPS calls,
+standalone OAuth refresh persistence, browser sign-in tool wiring, and MCP
+`tools/list` / `tools/call` behavior.

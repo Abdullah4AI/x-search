@@ -1,9 +1,11 @@
 import io
 import json
 import os
+import ssl
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
 from pathlib import Path
 from unittest import mock
@@ -111,6 +113,89 @@ class XSearchToolTests(unittest.TestCase):
         self.assertEqual(
             result["degraded_reason"],
             "no citations returned despite filters: allowed_x_handles",
+        )
+
+    def test_latest_author_query_gets_precision_hint_without_handle_filter(self):
+        captured = {}
+
+        def fake_post(url, headers, payload, timeout_seconds):
+            del url, headers, timeout_seconds
+            captured["payload"] = payload
+            return {
+                "output_text": "answer",
+                "citations": [{"url": "https://x.com/VioletsRiy/status/1"}],
+            }
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", side_effect=fake_post):
+            result = server.x_search_tool({"query": "وش آخر تغريدة نزلها رياض محمد نبيل"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["query_strategy"], "latest_author_post")
+        self.assertIn("official or verified X account", captured["payload"]["input"][0]["content"])
+
+    def test_latest_author_query_skips_precision_hint_with_handle_filter(self):
+        captured = {}
+
+        def fake_post(url, headers, payload, timeout_seconds):
+            del url, headers, timeout_seconds
+            captured["payload"] = payload
+            return {"output_text": "answer", "citations": []}
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", side_effect=fake_post):
+            result = server.x_search_tool(
+                {
+                    "query": "وش آخر تغريدة نزلها رياض محمد نبيل",
+                    "allowed_x_handles": ["VioletsRiy"],
+                }
+            )
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["query_strategy"])
+        self.assertEqual(
+            captured["payload"]["input"],
+            [{"role": "user", "content": "وش آخر تغريدة نزلها رياض محمد نبيل"}],
+        )
+
+    def test_latest_topic_query_skips_author_precision_hint(self):
+        captured = {}
+
+        def fake_post(url, headers, payload, timeout_seconds):
+            del url, headers, timeout_seconds
+            captured["payload"] = payload
+            return {"output_text": "answer", "citations": []}
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", side_effect=fake_post):
+            result = server.x_search_tool({"query": "recent posts about xAI"})
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["query_strategy"])
+        self.assertEqual(
+            captured["payload"]["input"],
+            [{"role": "user", "content": "recent posts about xAI"}],
         )
 
     def test_not_degraded_without_filters_or_with_inline_citation(self):
@@ -289,11 +374,12 @@ class OAuthResolutionTests(unittest.TestCase):
     def test_exchange_code_includes_pkce_challenge_echo(self):
         captured = {}
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, context=None):
             captured["url"] = request.full_url
             captured["headers"] = dict(request.header_items())
             captured["body"] = request.data.decode("utf-8")
             captured["timeout"] = timeout
+            captured["context"] = context
             return FakeHTTPResponse(
                 {
                     "access_token": "access",
@@ -315,6 +401,7 @@ class OAuthResolutionTests(unittest.TestCase):
 
         self.assertEqual(payload["access_token"], "access")
         self.assertEqual(captured["url"], "https://auth.x.ai/oauth2/token")
+        self.assertIsInstance(captured["context"], ssl.SSLContext)
         parsed = urllib.parse.parse_qs(captured["body"])
         self.assertEqual(parsed["grant_type"], ["authorization_code"])
         self.assertEqual(parsed["code_verifier"], ["verifier"])
@@ -428,6 +515,65 @@ class OAuthResolutionTests(unittest.TestCase):
         self.assertEqual(result["base_url"], "https://api.x.ai/v1")
 
 
+class HttpTransportTests(unittest.TestCase):
+    def test_post_json_uses_https_context(self):
+        context = object()
+        captured = {}
+
+        def fake_urlopen(request, timeout, context=None):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["context"] = context
+            return FakeHTTPResponse({"output_text": "ok"})
+
+        with mock.patch.object(server, "_https_context", return_value=context), mock.patch.object(
+            server.urllib.request,
+            "urlopen",
+            side_effect=fake_urlopen,
+        ):
+            result = server._post_json(
+                "https://api.x.ai/v1/responses",
+                {"Accept": "application/json"},
+                {"input": "hi"},
+                33,
+            )
+
+        self.assertEqual(result["output_text"], "ok")
+        self.assertEqual(captured["url"], "https://api.x.ai/v1/responses")
+        self.assertEqual(captured["timeout"], 33)
+        self.assertIs(captured["context"], context)
+
+    def test_tls_certificate_error_is_actionable(self):
+        def fake_urlopen(request, timeout, context=None):
+            del request, timeout, context
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError("certificate verify failed")
+            )
+
+        with mock.patch.object(server.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(server.XSearchError) as ctx:
+                server._post_json(
+                    "https://api.x.ai/v1/responses",
+                    {"Accept": "application/json"},
+                    {"input": "hi"},
+                    33,
+                )
+
+        self.assertIn("TLS certificate verification failed", str(ctx.exception))
+        self.assertIn("X_SEARCH_CA_BUNDLE", str(ctx.exception))
+
+    def test_default_config_favors_faster_search(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ):
+            config = server._x_search_config()
+
+        self.assertEqual(config["timeout_seconds"], 75)
+        self.assertEqual(config["retries"], 1)
+
+
 class McpProtocolTests(unittest.TestCase):
     def test_mcp_tools_list_exposes_auth_before_search(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(
@@ -439,7 +585,7 @@ class McpProtocolTests(unittest.TestCase):
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
             )
         names = [tool["name"] for tool in response["result"]["tools"]]
-        self.assertNotIn("x_search", names)
+        self.assertIn("x_search", names)
         self.assertIn("x_search_auth", names)
         self.assertIn("x_search_status", names)
 

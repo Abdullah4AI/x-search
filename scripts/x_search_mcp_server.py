@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import sys
 import tempfile
 import threading
@@ -39,8 +40,8 @@ XAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 XAI_OAUTH_REDIRECT_PORT = 56121
 XAI_OAUTH_REDIRECT_PATH = "/callback"
 DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
-DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
-DEFAULT_X_SEARCH_RETRIES = 2
+DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 75
+DEFAULT_X_SEARCH_RETRIES = 1
 XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 MAX_HANDLES = 10
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -455,6 +456,57 @@ def _read_json_response(response: Any, limit: int = MAX_RESPONSE_BYTES) -> Dict[
     return payload
 
 
+def _ca_bundle_path() -> Optional[str]:
+    configured = str(_env_value("X_SEARCH_CA_BUNDLE") or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_file():
+            return str(path)
+        raise XSearchError(f"X_SEARCH_CA_BUNDLE does not point to a file: {path}")
+
+    try:
+        import certifi  # type: ignore
+
+        certifi_path = Path(str(certifi.where())).expanduser()
+        if certifi_path.is_file():
+            return str(certifi_path)
+    except Exception:
+        pass
+    return None
+
+
+def _https_context() -> ssl.SSLContext:
+    cafile = _ca_bundle_path()
+    return ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+
+
+def _urlopen(request: urllib.request.Request, timeout_seconds: int) -> Any:
+    try:
+        return urllib.request.urlopen(
+            request,
+            timeout=timeout_seconds,
+            context=_https_context(),
+        )
+    except ssl.SSLCertVerificationError as exc:
+        raise XSearchError(
+            "TLS certificate verification failed while connecting to xAI. "
+            "Install certifi for this Python environment or set X_SEARCH_CA_BUNDLE "
+            "to a valid CA bundle path, then retry."
+        ) from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError) or (
+            isinstance(reason, ssl.SSLError)
+            and "CERTIFICATE_VERIFY_FAILED" in str(reason).upper()
+        ):
+            raise XSearchError(
+                "TLS certificate verification failed while connecting to xAI. "
+                "Install certifi for this Python environment or set X_SEARCH_CA_BUNDLE "
+                "to a valid CA bundle path, then retry."
+            ) from exc
+        raise
+
+
 def _redact(text: str) -> str:
     patterns = [
         r"Bearer\s+[A-Za-z0-9._~+/=-]+",
@@ -473,7 +525,7 @@ def _oauth_discovery(timeout_seconds: int) -> Dict[str, str]:
         XAI_OAUTH_DISCOVERY_URL,
         headers={"Accept": "application/json", "User-Agent": _user_agent()},
     )
-    with urllib.request.urlopen(request, timeout=max(5, timeout_seconds)) as response:
+    with _urlopen(request, max(5, timeout_seconds)) as response:
         payload = _read_json_response(response)
     token_endpoint = str(payload.get("token_endpoint") or "").strip()
     authorization_endpoint = str(payload.get("authorization_endpoint") or "").strip()
@@ -517,7 +569,7 @@ def _refresh_oauth_token(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(5, timeout_seconds)) as response:
+        with _urlopen(request, max(5, timeout_seconds)) as response:
             payload = _read_json_response(response)
     except urllib.error.HTTPError as exc:
         detail = _redact(_read_limited(exc, MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip())
@@ -748,7 +800,7 @@ def _exchange_code_for_tokens(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(20, timeout_seconds)) as response:
+        with _urlopen(request, max(20, timeout_seconds)) as response:
             payload = _read_json_response(response)
     except urllib.error.HTTPError as exc:
         detail = _redact(_read_limited(exc, MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip())
@@ -1098,6 +1150,73 @@ def _extract_inline_citations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return citations
 
 
+def _looks_like_latest_post_query(query: str) -> bool:
+    normalized = query.lower()
+    topic_markers = (
+        " about ",
+        " regarding ",
+        " around ",
+        " on ",
+        " عن ",
+        " حول ",
+        " بخصوص ",
+    )
+    if any(marker in normalized for marker in topic_markers):
+        return False
+    latest_terms = (
+        "latest",
+        "newest",
+        "recent",
+        "last post",
+        "last tweet",
+        "آخر",
+        "اخر",
+        "أحدث",
+        "احدث",
+    )
+    post_terms = (
+        "post",
+        "tweet",
+        "status",
+        "تغريدة",
+        "تغريده",
+        "منشور",
+        "بوست",
+    )
+    author_markers = (
+        " by ",
+        " from ",
+        " account",
+        " handle",
+        " profile",
+        "نزلها",
+        "نزلته",
+        "كتبها",
+        "حساب",
+        "من ",
+    )
+    return any(term in normalized for term in latest_terms) and any(
+        term in normalized for term in post_terms
+    ) and any(marker in normalized for marker in author_markers)
+
+
+def _effective_query(query: str, allowed: List[str], excluded: List[str]) -> Tuple[str, Optional[str]]:
+    if allowed or excluded or not _looks_like_latest_post_query(query):
+        return query, None
+    strategy = "latest_author_post"
+    return (
+        query
+        + "\n\n"
+        + "X Search instruction: If this asks for the latest X post by a named "
+        "person or organization and no handle filter is provided, first identify "
+        "the most relevant official or verified X account for that name. Then "
+        "return the newest original post from that account with its X URL. Do "
+        "not return replies unless no original post is available, and say when "
+        "the result is a reply rather than an original post.",
+        strategy,
+    )
+
+
 def _user_agent() -> str:
     return f"Codex-X-Search/{SERVER_VERSION}"
 
@@ -1131,7 +1250,7 @@ def _post_json(
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+    with _urlopen(request, timeout_seconds) as response:
         return _read_json_response(response)
 
 
@@ -1292,9 +1411,10 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     if enable_video_understanding:
         tool_def["enable_video_understanding"] = True
 
+    effective_query, query_strategy = _effective_query(query, allowed, excluded)
     payload = {
         "model": config["model"],
-        "input": [{"role": "user", "content": query}],
+        "input": [{"role": "user", "content": effective_query}],
         "tools": [tool_def],
         "store": False,
     }
@@ -1388,6 +1508,7 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
         "tool": "x_search",
         "model": payload["model"],
         "query": query,
+        "query_strategy": query_strategy,
         "answer": answer,
         "citations": citations,
         "inline_citations": inline_citations,
@@ -1547,8 +1668,7 @@ def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _mcp_result(request_id, {})
 
     if method == "tools/list":
-        tools = [X_SEARCH_TOOL, *SETUP_TOOLS] if check_x_search_requirements() else SETUP_TOOLS
-        return _mcp_result(request_id, {"tools": tools})
+        return _mcp_result(request_id, {"tools": [X_SEARCH_TOOL, *SETUP_TOOLS]})
 
     if method == "tools/call":
         name = str(params.get("name") or "")

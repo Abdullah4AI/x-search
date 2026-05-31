@@ -1,6 +1,6 @@
 {
   "name": "x-search",
-  "version": "0.2.0+codex.20260531140112",
+  "version": "0.2.0+codex.20260531144147",
   "description": "Search X posts and threads from Codex through xAI's built-in x_search Responses tool.",
   "author": {
     "name": "Abdullah Alrashoudi"
@@ -22,7 +22,7 @@
   "interface": {
     "displayName": "X Search",
     "shortDescription": "Search X posts and threads with xAI citations",
-    "longDescription": "X Search adds a standalone local MCP tool for Codex that calls xAI's built-in x_search Responses tool. It supports handle filters, date ranges, image and video understanding flags, built-in browser-based xAI sign-in, API-key fallback, citations, retries, and degraded-result detection.",
+    "longDescription": "X Search adds a standalone local MCP tool for Codex that calls xAI's built-in x_search Responses tool. It supports handle filters, date ranges, image and video understanding flags, built-in browser-based xAI sign-in, API-key fallback, citations, cert-aware HTTPS calls, faster defaults, latest-post query hinting, retries, and degraded-result detection.",
     "developerName": "Abdullah Alrashoudi",
     "category": "Research",
     "capabilities": [
