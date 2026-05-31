@@ -952,15 +952,12 @@ def _resolve_xai_credentials(
 
 
 def _has_configured_credentials() -> bool:
-    auth_path, auth_store = _load_auth_store()
-    del auth_path
-    tokens = auth_store.get("tokens") if isinstance(auth_store, dict) else None
-    has_oauth = bool(
-        isinstance(tokens, dict)
-        and str(tokens.get("access_token") or "").strip()
-    )
-    has_api_key = bool(str(_env_value("XAI_API_KEY") or "").strip())
-    return bool(has_oauth or has_api_key)
+    try:
+        timeout_seconds = int(_x_search_config()["timeout_seconds"])
+        token, _, _ = _resolve_xai_credentials(timeout_seconds)
+        return bool(str(token or "").strip())
+    except Exception:
+        return False
 
 
 def check_x_search_requirements() -> bool:
@@ -1178,15 +1175,31 @@ def x_search_status_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
         and str(tokens.get("access_token") or "").strip()
     )
     has_api_key = bool(str(_env_value("XAI_API_KEY") or "").strip())
+    authenticated = False
+    credential_source: Optional[str] = None
+    base_url: Optional[str] = None
+    error: Optional[str] = None
+    try:
+        timeout_seconds = int(_x_search_config()["timeout_seconds"])
+        token, resolved_base_url, source = _resolve_xai_credentials(timeout_seconds)
+        authenticated = bool(str(token or "").strip())
+        credential_source = source if authenticated else None
+        base_url = resolved_base_url if authenticated else None
+    except XSearchNoCredentialsError as exc:
+        error = str(exc)
+    except XSearchError as exc:
+        error = str(exc)
     return {
         "success": True,
         "provider": "xai",
         "tool": "x_search_status",
-        "authenticated": bool(has_oauth or has_api_key),
+        "authenticated": authenticated,
         "oauth_configured": has_oauth,
         "api_key_configured": has_api_key,
-        "credential_source": "xai-oauth" if has_oauth else "xai-api-key" if has_api_key else None,
+        "credential_source": credential_source,
+        "base_url": base_url,
         "auth_store": str(auth_path),
+        "error": error,
     }
 
 

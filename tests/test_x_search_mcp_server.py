@@ -113,6 +113,68 @@ class XSearchToolTests(unittest.TestCase):
             "no citations returned despite filters: allowed_x_handles",
         )
 
+    def test_not_degraded_without_filters_or_with_inline_citation(self):
+        inline_payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Real post.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://x.com/xai/status/1",
+                                    "title": "xAI",
+                                    "start_index": 0,
+                                    "end_index": 4,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", side_effect=[{"output_text": "broad", "citations": []}, inline_payload]):
+            broad = server.x_search_tool({"query": "anything"})
+            filtered = server.x_search_tool({"query": "anything", "allowed_x_handles": ["xai"]})
+
+        self.assertFalse(broad["degraded"])
+        self.assertIsNone(broad["degraded_reason"])
+        self.assertFalse(filtered["degraded"])
+        self.assertIsNone(filtered["degraded_reason"])
+        self.assertEqual(filtered["inline_citations"][0]["url"], "https://x.com/xai/status/1")
+
+    def test_allows_future_to_date(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_read_x_search_config",
+            return_value={"retries": "0"},
+        ), mock.patch.object(server, "_post_json", return_value={"output_text": "answer", "citations": []}):
+            result = server.x_search_tool(
+                {
+                    "query": "anything",
+                    "from_date": "2026-05-30",
+                    "to_date": "2999-01-01",
+                }
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["answer"], "answer")
+
     def test_rejects_conflicting_handle_filters(self):
         with mock.patch.object(server, "_resolve_xai_credentials") as resolve_credentials:
             with self.assertRaises(server.XSearchError) as ctx:
@@ -283,6 +345,47 @@ class OAuthResolutionTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertFalse(result["authenticated"])
         self.assertEqual(result["auth_store"], str(Path(home) / "auth.json"))
+        self.assertIn("x_search_auth", result["error"])
+
+    def test_status_refreshes_oauth_before_reporting_authenticated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth_home = Path(tmp)
+            auth_path = auth_home / "auth.json"
+            auth_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "provider": "xai",
+                        "auth_mode": "oauth_pkce",
+                        "tokens": {
+                            "access_token": "expired.token.value",
+                            "refresh_token": "refresh",
+                        },
+                        "discovery": {
+                            "token_endpoint": "https://auth.x.ai/oauth2/token",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"X_SEARCH_HOME": str(auth_home)},
+                clear=True,
+            ), mock.patch.object(
+                server,
+                "_jwt_is_expiring",
+                return_value=True,
+            ), mock.patch.object(
+                server,
+                "_refresh_oauth_token",
+                return_value={"access_token": "fresh", "refresh_token": "refresh"},
+            ):
+                result = server.x_search_status_tool({})
+
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["credential_source"], "xai-oauth")
+        self.assertEqual(result["base_url"], "https://api.x.ai/v1")
 
 
 class McpProtocolTests(unittest.TestCase):
