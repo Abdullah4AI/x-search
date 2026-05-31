@@ -416,7 +416,7 @@ def _validate_base_url(base_url: str, credential_source: str) -> str:
     if _xai_endpoint_ok(stripped):
         return stripped
     allow_custom = str(_env_value("X_SEARCH_ALLOW_CUSTOM_BASE_URL", "") or "").lower()
-    if credential_source == "xai-api-key" and allow_custom in {"1", "true", "yes"}:
+    if credential_source == "xai" and allow_custom in {"1", "true", "yes"}:
         return stripped
     raise XSearchError(
         "Refusing to send xAI bearer to a non-xAI base URL. Set "
@@ -937,8 +937,8 @@ def _resolve_xai_credentials(
 
     api_key = str(_env_value("XAI_API_KEY") or "").strip()
     if api_key:
-        base_url = _validate_base_url(str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL), "xai-api-key")
-        return api_key, base_url, "xai-api-key"
+        base_url = _validate_base_url(str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL), "xai")
+        return api_key, base_url, "xai"
 
     if oauth_error:
         raise XSearchNoCredentialsError(

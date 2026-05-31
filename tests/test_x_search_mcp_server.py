@@ -68,7 +68,7 @@ class XSearchToolTests(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["credential_source"], "xai-api-key")
+        self.assertEqual(result["credential_source"], "xai")
         self.assertEqual(captured["url"], "https://api.x.ai/v1/responses")
         self.assertEqual(captured["timeout_seconds"], 31)
         self.assertEqual(captured["headers"]["Authorization"], "Bearer key")
@@ -331,7 +331,7 @@ class OAuthResolutionTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertTrue(result["authenticated"])
-        self.assertEqual(result["credential_source"], "xai-api-key")
+        self.assertEqual(result["credential_source"], "xai")
         login.assert_not_called()
 
     def test_status_uses_codex_x_search_home(self):
