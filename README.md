@@ -1,8 +1,21 @@
 # X Search for Codex
 
-Standalone Codex plugin that exposes an MCP tool named `x_search`. It calls
+Codex marketplace for a standalone plugin that exposes an MCP tool named
+`x_search`. It calls
 xAI's Responses API with the server-side `{"type": "x_search"}` tool and owns
 its own xAI sign-in flow.
+
+## Add to Codex
+
+In Codex, open **Add marketplace** and use:
+
+- Source: `git@github.com:Abdullah4AI/x-search.git`
+- Git ref: `main`
+- Sparse paths: leave empty
+
+The repository root contains `.agents/plugins/marketplace.json`, and the plugin
+itself lives at `plugins/x-search`, which is the layout Codex expects for a Git
+marketplace.
 
 ## Features
 
@@ -47,7 +60,7 @@ The `x_search_auth` tool:
 You can also sign in from a terminal:
 
 ```bash
-python3 scripts/x_search_mcp_server.py auth
+python3 plugins/x-search/scripts/x_search_mcp_server.py auth
 ```
 
 Tokens are stored outside the plugin repository in `~/.codex-x-search/auth.json`

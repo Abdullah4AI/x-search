@@ -12,14 +12,15 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "scripts"))
+PLUGIN_ROOT = ROOT / "plugins" / "x-search"
+sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
 import x_search_mcp_server as server  # noqa: E402
 
 
 class PluginPackageTests(unittest.TestCase):
     def test_mcp_server_config_launches_from_plugin_root(self):
-        config = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
+        config = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
         server_config = config["mcpServers"]["x-search"]
 
         self.assertEqual(server_config["command"], "python3")

@@ -1,0 +1,20 @@
+{
+  "name": "x-search",
+  "interface": {
+    "displayName": "X Search"
+  },
+  "plugins": [
+    {
+      "name": "x-search",
+      "source": {
+        "source": "local",
+        "path": "./plugins/x-search"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Research"
+    }
+  ]
+}
