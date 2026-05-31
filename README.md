@@ -13,6 +13,13 @@ In Codex, open **Add marketplace** and use:
 - Git ref: `main`
 - Sparse paths: leave empty
 
+If you prefer a sparse checkout, use these two sparse paths instead:
+
+```text
+.agents/plugins/marketplace.json
+plugins/x-search
+```
+
 The repository root contains `.agents/plugins/marketplace.json`, and the plugin
 itself lives at `plugins/x-search`, which is the layout Codex expects for a Git
 marketplace.
