@@ -36,6 +36,24 @@ To skip importing Hermes' resolver and use the standalone fallback implementatio
 X_SEARCH_DISABLE_HERMES_RESOLVER=1
 ```
 
+## Credential Isolation
+
+This repository does not include xAI credentials, Hermes OAuth tokens, API keys,
+or local credential files. The MCP server resolves credentials only at runtime
+from the current user's machine:
+
+- the current user's `~/.hermes/auth.json`
+- the current user's `~/.hermes/.env`
+- the current process environment
+
+Sharing this plugin does not share your local `~/.hermes` directory or your
+environment variables. Anyone who installs the plugin needs their own Hermes
+xAI OAuth login or their own `XAI_API_KEY`.
+
+The repository `.gitignore` excludes common credential files such as `.env`,
+`auth.json`, `.hermes/`, and private key formats. Keep those files local and
+out of commits.
+
 ## Configuration
 
 The x_search model, timeout, and retry settings follow Hermes' `x_search:`
