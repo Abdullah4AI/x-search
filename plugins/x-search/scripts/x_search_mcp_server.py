@@ -809,11 +809,6 @@ def _start_callback_server(
     return server, thread, result, redirect_uri
 
 
-def _oauth_start_url(server: ThreadingHTTPServer) -> str:
-    port = int(server.server_address[1])
-    return f"http://{XAI_OAUTH_REDIRECT_HOST}:{port}{XAI_OAUTH_START_PATH}"
-
-
 def _wait_for_callback(
     server: ThreadingHTTPServer,
     thread: threading.Thread,
@@ -932,7 +927,7 @@ def _run_xai_oauth_login(
 ) -> Dict[str, Any]:
     discovery = _oauth_discovery(timeout_seconds)
     server, thread, callback_result, redirect_uri = _start_callback_server()
-    start_url = _oauth_start_url(server)
+    browser_url = f"http://127.0.0.1:{int(server.server_address[1])}/start"
     try:
         code_verifier = _oauth_pkce_code_verifier()
         code_challenge = _oauth_pkce_code_challenge(code_verifier)
@@ -948,13 +943,13 @@ def _run_xai_oauth_login(
         callback_result["authorize_url"] = authorize_url
 
         print("Open this local URL to authorize X Search with xAI:", file=sys.stderr)
-        print(start_url, file=sys.stderr)
+        print(browser_url, file=sys.stderr)
         print("Waiting for the local xAI callback.", file=sys.stderr)
 
         browser_opened = False
         if open_browser:
             try:
-                browser_opened = bool(webbrowser.open(start_url))
+                browser_opened = bool(webbrowser.open(browser_url))
             except Exception:
                 browser_opened = False
             if browser_opened:
