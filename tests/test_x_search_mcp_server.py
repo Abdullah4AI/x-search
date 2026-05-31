@@ -162,18 +162,17 @@ class XSearchToolTests(unittest.TestCase):
                 server._resolve_xai_credentials(30)
         self.assertIn("non-xAI base URL", str(ctx.exception))
 
-    def test_auto_auth_runs_when_search_has_no_credentials(self):
-        with mock.patch.object(
-            server,
-            "_resolve_xai_credentials",
-            side_effect=[
-                server.XSearchNoCredentialsError("missing"),
-                ("fresh", "https://api.x.ai/v1", "xai-oauth"),
-            ],
-        ), mock.patch.object(server, "_run_xai_oauth_login", return_value={}) as login:
-            token, base_url, source = server._ensure_xai_credentials(180, interactive=True)
-        self.assertEqual((token, base_url, source), ("fresh", "https://api.x.ai/v1", "xai-oauth"))
-        login.assert_called_once()
+    def test_search_requires_auth_without_starting_login(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ), mock.patch.object(server, "_run_xai_oauth_login") as login:
+            with self.assertRaises(server.XSearchNoCredentialsError) as ctx:
+                server.x_search_tool({"query": "anything"})
+
+        self.assertIn("x_search_auth", str(ctx.exception))
+        login.assert_not_called()
 
 
 class OAuthResolutionTests(unittest.TestCase):
@@ -287,14 +286,31 @@ class OAuthResolutionTests(unittest.TestCase):
 
 
 class McpProtocolTests(unittest.TestCase):
-    def test_mcp_tools_list_always_exposes_search_and_auth(self):
-        response = server._handle_mcp_request(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        )
+    def test_mcp_tools_list_exposes_auth_before_search(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ):
+            response = server._handle_mcp_request(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
         names = [tool["name"] for tool in response["result"]["tools"]]
-        self.assertIn("x_search", names)
+        self.assertNotIn("x_search", names)
         self.assertIn("x_search_auth", names)
         self.assertIn("x_search_status", names)
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ):
+            authed_response = server._handle_mcp_request(
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+            )
+        authed_names = [tool["name"] for tool in authed_response["result"]["tools"]]
+        self.assertIn("x_search", authed_names)
+        self.assertIn("x_search_auth", authed_names)
 
         call_response = server._handle_mcp_request(
             {
@@ -307,6 +323,25 @@ class McpProtocolTests(unittest.TestCase):
         self.assertTrue(call_response["result"]["isError"])
         body = json.loads(call_response["result"]["content"][0]["text"])
         self.assertEqual(body["error"], "query is required for x_search")
+
+    def test_mcp_search_call_reports_auth_required(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ):
+            call_response = server._handle_mcp_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "x_search", "arguments": {"query": "xai"}},
+                }
+            )
+        self.assertTrue(call_response["result"]["isError"])
+        body = json.loads(call_response["result"]["content"][0]["text"])
+        self.assertTrue(body["auth_required"])
+        self.assertEqual(body["auth_tool"], "x_search_auth")
 
     def test_mcp_content_length_round_trip(self):
         original_stdin = sys.stdin

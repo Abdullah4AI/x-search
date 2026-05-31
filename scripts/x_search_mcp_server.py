@@ -141,8 +141,8 @@ X_SEARCH_TOOL: Dict[str, Any] = {
     "description": (
         "Search X posts, profiles, and threads using xAI's built-in x_search "
         "Responses tool. Use this for current discussion, reactions, or claims "
-        "on X rather than general web pages. If xAI authentication is not set "
-        "up yet, this tool starts the browser sign-in flow automatically."
+        "on X rather than general web pages. Authentication must be completed "
+        "with x_search_auth before this tool is used."
     ),
     "inputSchema": X_SEARCH_INPUT_SCHEMA,
 }
@@ -172,8 +172,7 @@ X_SEARCH_LOGOUT_TOOL: Dict[str, Any] = {
 }
 
 
-MCP_TOOLS = [
-    X_SEARCH_TOOL,
+SETUP_TOOLS = [
     X_SEARCH_AUTH_TOOL,
     X_SEARCH_STATUS_TOOL,
     X_SEARCH_LOGOUT_TOOL,
@@ -943,46 +942,29 @@ def _resolve_xai_credentials(
 
     if oauth_error:
         raise XSearchNoCredentialsError(
-            f"xAI sign-in needs to be refreshed: {oauth_error}"
+            "X Search authentication needs to be refreshed. Ask the user to "
+            f"run x_search_auth, then retry x_search. Details: {oauth_error}"
         ) from oauth_error
     raise XSearchNoCredentialsError(
-        "No xAI credentials are configured for X Search."
+        "X Search authentication is required. Ask the user to run "
+        "x_search_auth, then retry x_search."
     )
 
 
-def _auto_auth_enabled() -> bool:
-    value = str(_env_value("X_SEARCH_AUTO_AUTH", "1") or "1").lower()
-    return value not in {"0", "false", "no", "off"}
-
-
-def _ensure_xai_credentials(
-    timeout_seconds: int,
-    *,
-    force_refresh: bool = False,
-    interactive: bool = False,
-) -> Tuple[str, str, str]:
-    try:
-        return _resolve_xai_credentials(timeout_seconds, force_refresh=force_refresh)
-    except XSearchNoCredentialsError as exc:
-        if not interactive or not _auto_auth_enabled():
-            raise
-        auth_timeout = max(180, timeout_seconds)
-        try:
-            _run_xai_oauth_login(timeout_seconds=auth_timeout, open_browser=True)
-        except XSearchError as auth_exc:
-            raise XSearchNoCredentialsError(
-                f"xAI authentication was not completed: {auth_exc}"
-            ) from auth_exc
-        return _resolve_xai_credentials(timeout_seconds, force_refresh=force_refresh)
+def _has_configured_credentials() -> bool:
+    auth_path, auth_store = _load_auth_store()
+    del auth_path
+    tokens = auth_store.get("tokens") if isinstance(auth_store, dict) else None
+    has_oauth = bool(
+        isinstance(tokens, dict)
+        and str(tokens.get("access_token") or "").strip()
+    )
+    has_api_key = bool(str(_env_value("XAI_API_KEY") or "").strip())
+    return bool(has_oauth or has_api_key)
 
 
 def check_x_search_requirements() -> bool:
-    try:
-        timeout_seconds = int(_x_search_config()["timeout_seconds"])
-        api_key, _, _ = _resolve_xai_credentials(timeout_seconds)
-        return bool(str(api_key or "").strip())
-    except Exception:
-        return False
+    return _has_configured_credentials()
 
 
 def _normalize_handles(value: Any, field_name: str) -> List[str]:
@@ -1245,7 +1227,7 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     enable_image_understanding = _bool_arg(arguments, "enable_image_understanding")
     enable_video_understanding = _bool_arg(arguments, "enable_video_understanding")
 
-    api_key, base_url, source = _ensure_xai_credentials(timeout_seconds, interactive=True)
+    api_key, base_url, source = _resolve_xai_credentials(timeout_seconds)
 
     tool_def: Dict[str, Any] = {"type": "x_search"}
     if allowed:
@@ -1288,10 +1270,9 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
             break
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and source == "xai-oauth" and not force_refreshed:
-                api_key, base_url, source = _ensure_xai_credentials(
+                api_key, base_url, source = _resolve_xai_credentials(
                     timeout_seconds,
                     force_refresh=True,
-                    interactive=True,
                 )
                 headers["Authorization"] = f"Bearer {api_key}"
                 force_refreshed = True
@@ -1378,6 +1359,13 @@ def _tool_error(tool_name: str, message: str, error_type: str = "XSearchError") 
         "error": message,
         "error_type": error_type,
     }
+
+
+def _auth_required_error(tool_name: str, message: str) -> Dict[str, Any]:
+    result = _tool_error(tool_name, message, "XSearchNoCredentialsError")
+    result["auth_required"] = True
+    result["auth_tool"] = "x_search_auth"
+    return result
 
 
 def _read_mcp_message() -> Optional[Tuple[Dict[str, Any], str]]:
@@ -1506,7 +1494,8 @@ def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _mcp_result(request_id, {})
 
     if method == "tools/list":
-        return _mcp_result(request_id, {"tools": MCP_TOOLS})
+        tools = [X_SEARCH_TOOL, *SETUP_TOOLS] if check_x_search_requirements() else SETUP_TOOLS
+        return _mcp_result(request_id, {"tools": tools})
 
     if method == "tools/call":
         name = str(params.get("name") or "")
@@ -1515,6 +1504,8 @@ def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             result = _call_tool(name, arguments)
         except KeyError:
             return _mcp_error(request_id, -32602, f"Unknown tool: {name}")
+        except XSearchNoCredentialsError as exc:
+            result = _auth_required_error(name, str(exc))
         except XSearchError as exc:
             result = _tool_error(name, str(exc))
         except Exception as exc:

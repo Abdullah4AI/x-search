@@ -11,17 +11,19 @@ for general web pages.
 
 ## Workflow
 
-1. Call `x_search` with a concise query.
-2. If authentication is missing, let `x_search` start the built-in xAI browser
-   sign-in flow, or call `x_search_auth` directly when the user asks to sign in.
-3. Add `allowed_x_handles` when the user names up to 10 accounts to search
+1. Call `x_search_status` first when the user wants an X search.
+2. If `authenticated` is false, ask the user to authenticate, then call
+   `x_search_auth` if they agree.
+3. Use `x_search` only after authentication is complete.
+4. Call `x_search` with a concise query.
+5. Add `allowed_x_handles` when the user names up to 10 accounts to search
    exclusively. Do not use it together with `excluded_x_handles`.
-4. Add `from_date` and `to_date` only as strict `YYYY-MM-DD` dates.
-5. Set `enable_image_understanding` or `enable_video_understanding` when the
+6. Add `from_date` and `to_date` only as strict `YYYY-MM-DD` dates.
+7. Set `enable_image_understanding` or `enable_video_understanding` when the
    user asks about media attached to matching posts.
-6. Cite the returned X URLs. Prefer `inline_citations` when present, otherwise
+8. Cite the returned X URLs. Prefer `inline_citations` when present, otherwise
    use `citations`.
-7. If `degraded` is `true`, say the result was not citation-backed and either
+9. If `degraded` is `true`, say the result was not citation-backed and either
    broaden the query/date/handle filters or ask whether to retry.
 
 ## Safety

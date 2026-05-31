@@ -24,16 +24,17 @@ The plugin resolves credentials in this order:
 2. `XAI_API_KEY` from `~/.codex-x-search/.env`
 3. `XAI_API_KEY` from the current process environment
 
-When `x_search` is called and no credential exists, the plugin starts its own
-xAI sign-in flow automatically:
+Before using `x_search`, check authentication with `x_search_status`. If the
+user is not authenticated, ask them to authenticate with `x_search_auth` first.
+After authentication completes, Codex can use `x_search`.
+
+The `x_search_auth` tool:
 
 1. It starts a temporary callback server on `127.0.0.1`.
 2. It opens the xAI authorization page in your default browser.
 3. After you approve access, it stores the token locally for your user only.
-4. It continues the original X Search request.
 
-You can also sign in directly through the MCP tool `x_search_auth`, or from a
-terminal:
+You can also sign in from a terminal:
 
 ```bash
 python3 scripts/x_search_mcp_server.py auth
@@ -81,7 +82,6 @@ Environment variables override the config file:
 - `X_SEARCH_TIMEOUT_SECONDS`
 - `X_SEARCH_RETRIES`
 - `X_SEARCH_HOME`
-- `X_SEARCH_AUTO_AUTH`
 - `XAI_API_KEY`
 - `XAI_BASE_URL`
 
@@ -113,6 +113,10 @@ Additional MCP tools:
 - `x_search_auth`: opens the xAI sign-in flow and stores a local token
 - `x_search_status`: reports whether this user has a local credential
 - `x_search_logout`: removes the stored OAuth token for this user
+
+`x_search` is exposed only after the plugin detects a local OAuth token or
+`XAI_API_KEY`. Until then, `x_search_auth` and `x_search_status` remain
+available so Codex can ask the user to authenticate first.
 
 ## Validation
 
