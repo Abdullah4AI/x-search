@@ -1,8 +1,8 @@
 # X Search for Codex
 
-Codex plugin that exposes an MCP tool named `x_search`. It mirrors Hermes'
-X Search tool by calling xAI's Responses API with the server-side
-`{"type": "x_search"}` tool.
+Standalone Codex plugin that exposes an MCP tool named `x_search`. It calls
+xAI's Responses API with the server-side `{"type": "x_search"}` tool and owns
+its own xAI sign-in flow.
 
 ## Features
 
@@ -12,61 +12,78 @@ X Search tool by calling xAI's Responses API with the server-side
 - `enable_image_understanding` and `enable_video_understanding`
 - xAI citations and inline URL citation extraction
 - `degraded` result flag when filters are active but no citations are returned
-- xAI OAuth reuse from `~/.hermes/auth.json`, preferred when available
-- `XAI_API_KEY` fallback using Hermes env precedence: `~/.hermes/.env`, then process environment
-- Config reuse from Hermes `load_config().get("x_search")`, with `~/.hermes/config.yaml` parsing as fallback
+- Built-in browser-based xAI OAuth PKCE sign-in with local token storage
+- `XAI_API_KEY` fallback from `~/.codex-x-search/.env` or the process environment
+- Local config through `~/.codex-x-search/config.json` or environment variables
 
 ## Authentication
 
 The plugin resolves credentials in this order:
 
-1. Hermes' own xAI HTTP resolver, when `~/.hermes/hermes-agent` is available
-2. Standalone Hermes-compatible xAI OAuth refresh from `~/.hermes/auth.json`
-3. `XAI_API_KEY` from `~/.hermes/.env`, then process environment
+1. xAI OAuth token stored by this plugin in `~/.codex-x-search/auth.json`
+2. `XAI_API_KEY` from `~/.codex-x-search/.env`
+3. `XAI_API_KEY` from the current process environment
 
-OAuth access tokens are refreshed when possible. To skip Hermes OAuth and force the API-key path, set:
+When `x_search` is called and no credential exists, the plugin starts its own
+xAI sign-in flow automatically:
+
+1. It starts a temporary callback server on `127.0.0.1`.
+2. It opens the xAI authorization page in your default browser.
+3. After you approve access, it stores the token locally for your user only.
+4. It continues the original X Search request.
+
+You can also sign in directly through the MCP tool `x_search_auth`, or from a
+terminal:
 
 ```bash
-X_SEARCH_DISABLE_HERMES_OAUTH=1
+python3 scripts/x_search_mcp_server.py auth
 ```
 
-To skip importing Hermes' resolver and use the standalone fallback implementation, set:
-
-```bash
-X_SEARCH_DISABLE_HERMES_RESOLVER=1
-```
+Tokens are stored outside the plugin repository in `~/.codex-x-search/auth.json`
+with file mode `0600` where the platform allows it.
 
 ## Credential Isolation
 
-This repository does not include xAI credentials, Hermes OAuth tokens, API keys,
-or local credential files. The MCP server resolves credentials only at runtime
-from the current user's machine:
+This repository does not include xAI credentials, OAuth tokens, API keys, or
+local credential files. The MCP server resolves credentials only at runtime from
+the current user's machine:
 
-- the current user's `~/.hermes/auth.json`
-- the current user's `~/.hermes/.env`
+- the current user's `~/.codex-x-search/auth.json`
+- the current user's `~/.codex-x-search/.env`
 - the current process environment
 
-Sharing this plugin does not share your local `~/.hermes` directory or your
-environment variables. Anyone who installs the plugin needs their own Hermes
-xAI OAuth login or their own `XAI_API_KEY`.
+Sharing this plugin does not share your local credential directory or your
+environment variables. Anyone who installs the plugin needs their own xAI
+sign-in or their own `XAI_API_KEY`.
 
 The repository `.gitignore` excludes common credential files such as `.env`,
-`auth.json`, `.hermes/`, and private key formats. Keep those files local and
-out of commits.
+`auth.json`, `.codex-x-search/`, and private key formats. Keep those files local
+and out of commits.
 
 ## Configuration
 
-The x_search model, timeout, and retry settings follow Hermes' `x_search:`
-configuration. The defaults are:
+The x_search model, timeout, and retry settings can be set in
+`~/.codex-x-search/config.json`:
 
-The plugin reads this Hermes-compatible block:
-
-```yaml
-x_search:
-  model: grok-4.20-reasoning
-  timeout_seconds: 180
-  retries: 2
+```json
+{
+  "x_search": {
+    "model": "grok-4.20-reasoning",
+    "timeout_seconds": 180,
+    "retries": 2
+  }
+}
 ```
+
+Environment variables override the config file:
+
+- `X_SEARCH_MODEL`
+- `X_SEARCH_TIMEOUT_SECONDS`
+- `X_SEARCH_RETRIES`
+- `X_SEARCH_HOME`
+- `X_SEARCH_AUTO_AUTH`
+- `XAI_API_KEY`
+- `XAI_BASE_URL`
 
 For safety, `XAI_BASE_URL` must point to an HTTPS `x.ai` host. If you
 intentionally use a trusted proxy for API-key traffic, set:
@@ -91,6 +108,12 @@ The result is JSON text with `success`, `answer`, `citations`,
 `inline_citations`, `degraded`, `degraded_reason`, `credential_source`, `model`,
 and `query`.
 
+Additional MCP tools:
+
+- `x_search_auth`: opens the xAI sign-in flow and stores a local token
+- `x_search_status`: reports whether this user has a local credential
+- `x_search_logout`: removes the stored OAuth token for this user
+
 ## Validation
 
 Run the local test suite with:
@@ -100,5 +123,5 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests cover the xAI Responses payload shape, filter/date validation,
-degraded-result signaling, Hermes OAuth refresh persistence, and MCP
-`tools/list` / `tools/call` behavior.
+degraded-result signaling, standalone OAuth refresh persistence, browser sign-in
+tool wiring, and MCP `tools/list` / `tools/call` behavior.

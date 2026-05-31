@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -14,8 +15,23 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import x_search_mcp_server as server  # noqa: E402
 
 
+class FakeHTTPResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, size=-1):
+        del size
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class XSearchToolTests(unittest.TestCase):
-    def test_builds_xai_responses_payload_like_hermes(self):
+    def test_builds_xai_responses_payload(self):
         captured = {}
 
         def fake_post(url, headers, payload, timeout_seconds):
@@ -28,18 +44,16 @@ class XSearchToolTests(unittest.TestCase):
                 "citations": [{"url": "https://x.com/xai/status/1"}],
             }
 
-        with mock.patch.dict(
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
             os.environ,
             {
-                "HERMES_HOME": tempfile.mkdtemp(),
-                "X_SEARCH_DISABLE_HERMES_RESOLVER": "1",
-                "X_SEARCH_DISABLE_HERMES_OAUTH": "1",
+                "X_SEARCH_HOME": home,
                 "XAI_API_KEY": "key",
             },
-            clear=False,
+            clear=True,
         ), mock.patch.object(
             server,
-            "_read_hermes_x_search_config",
+            "_read_x_search_config",
             return_value={"model": "grok-test", "timeout_seconds": "31", "retries": "0"},
         ), mock.patch.object(server, "_post_json", side_effect=fake_post):
             result = server.x_search_tool(
@@ -54,7 +68,7 @@ class XSearchToolTests(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
-        self.assertEqual(result["credential_source"], "xai")
+        self.assertEqual(result["credential_source"], "xai-api-key")
         self.assertEqual(captured["url"], "https://api.x.ai/v1/responses")
         self.assertEqual(captured["timeout_seconds"], 31)
         self.assertEqual(captured["headers"]["Authorization"], "Bearer key")
@@ -78,18 +92,16 @@ class XSearchToolTests(unittest.TestCase):
         )
 
     def test_marks_degraded_for_filtered_uncited_result(self):
-        with mock.patch.dict(
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
             os.environ,
             {
-                "HERMES_HOME": tempfile.mkdtemp(),
-                "X_SEARCH_DISABLE_HERMES_RESOLVER": "1",
-                "X_SEARCH_DISABLE_HERMES_OAUTH": "1",
+                "X_SEARCH_HOME": home,
                 "XAI_API_KEY": "key",
             },
-            clear=False,
+            clear=True,
         ), mock.patch.object(
             server,
-            "_read_hermes_x_search_config",
+            "_read_x_search_config",
             return_value={"retries": "0"},
         ), mock.patch.object(server, "_post_json", return_value={"output_text": "answer"}):
             result = server.x_search_tool({"query": "anything", "allowed_x_handles": ["ghost"]})
@@ -102,16 +114,7 @@ class XSearchToolTests(unittest.TestCase):
         )
 
     def test_rejects_conflicting_handle_filters(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "HERMES_HOME": tempfile.mkdtemp(),
-                "X_SEARCH_DISABLE_HERMES_RESOLVER": "1",
-                "X_SEARCH_DISABLE_HERMES_OAUTH": "1",
-                "XAI_API_KEY": "key",
-            },
-            clear=False,
-        ), mock.patch.object(server, "_resolve_xai_credentials") as resolve_credentials:
+        with mock.patch.object(server, "_resolve_xai_credentials") as resolve_credentials:
             with self.assertRaises(server.XSearchError) as ctx:
                 server.x_search_tool(
                     {
@@ -124,16 +127,7 @@ class XSearchToolTests(unittest.TestCase):
         resolve_credentials.assert_not_called()
 
     def test_rejects_future_from_date_before_http_call(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "HERMES_HOME": tempfile.mkdtemp(),
-                "X_SEARCH_DISABLE_HERMES_RESOLVER": "1",
-                "X_SEARCH_DISABLE_HERMES_OAUTH": "1",
-                "XAI_API_KEY": "key",
-            },
-            clear=False,
-        ), mock.patch.object(server, "_post_json") as post_json, mock.patch.object(
+        with mock.patch.object(server, "_post_json") as post_json, mock.patch.object(
             server,
             "_resolve_xai_credentials",
         ) as resolve_credentials:
@@ -155,51 +149,49 @@ class XSearchToolTests(unittest.TestCase):
         resolve_credentials.assert_not_called()
 
     def test_rejects_custom_api_key_base_url_by_default(self):
-        with mock.patch.dict(
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
             os.environ,
             {
-                "HERMES_HOME": tempfile.mkdtemp(),
-                "X_SEARCH_DISABLE_HERMES_RESOLVER": "1",
-                "X_SEARCH_DISABLE_HERMES_OAUTH": "1",
+                "X_SEARCH_HOME": home,
                 "XAI_API_KEY": "key",
                 "XAI_BASE_URL": "https://example.com/v1",
             },
-            clear=False,
+            clear=True,
         ):
             with self.assertRaises(server.XSearchError) as ctx:
                 server._resolve_xai_credentials(30)
         self.assertIn("non-xAI base URL", str(ctx.exception))
 
-
-class OAuthResolutionTests(unittest.TestCase):
-    def test_prefers_hermes_runtime_resolver(self):
+    def test_auto_auth_runs_when_search_has_no_credentials(self):
         with mock.patch.object(
             server,
-            "_resolve_with_hermes_runtime",
-            return_value=("token", "https://api.x.ai/v1", "xai-oauth"),
-        ), mock.patch.object(server, "_resolve_oauth_credentials") as standalone_oauth:
-            self.assertEqual(
-                server._resolve_xai_credentials(30),
-                ("token", "https://api.x.ai/v1", "xai-oauth"),
-            )
-        standalone_oauth.assert_not_called()
+            "_resolve_xai_credentials",
+            side_effect=[
+                server.XSearchNoCredentialsError("missing"),
+                ("fresh", "https://api.x.ai/v1", "xai-oauth"),
+            ],
+        ), mock.patch.object(server, "_run_xai_oauth_login", return_value={}) as login:
+            token, base_url, source = server._ensure_xai_credentials(180, interactive=True)
+        self.assertEqual((token, base_url, source), ("fresh", "https://api.x.ai/v1", "xai-oauth"))
+        login.assert_called_once()
 
+
+class OAuthResolutionTests(unittest.TestCase):
     def test_refresh_discovers_and_persists_missing_token_endpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
-            hermes_home = Path(tmp)
-            auth_path = hermes_home / "auth.json"
+            auth_home = Path(tmp)
+            auth_path = auth_home / "auth.json"
             auth_path.write_text(
                 json.dumps(
                     {
-                        "providers": {
-                            "xai-oauth": {
-                                "tokens": {
-                                    "access_token": "expired.token.value",
-                                    "refresh_token": "refresh",
-                                },
-                                "discovery": {},
-                            }
-                        }
+                        "version": 1,
+                        "provider": "xai",
+                        "auth_mode": "oauth_pkce",
+                        "tokens": {
+                            "access_token": "expired.token.value",
+                            "refresh_token": "refresh",
+                        },
+                        "discovery": {},
                     }
                 ),
                 encoding="utf-8",
@@ -207,17 +199,12 @@ class OAuthResolutionTests(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {
-                    "HERMES_HOME": str(hermes_home),
-                    "X_SEARCH_DISABLE_HERMES_RESOLVER": "1",
-                },
-                clear=False,
-            ), (
-                mock.patch.object(
-                    server,
-                    "_oauth_discovery",
-                    return_value={"token_endpoint": "https://auth.x.ai/oauth2/token"},
-                )
+                {"X_SEARCH_HOME": str(auth_home)},
+                clear=True,
+            ), mock.patch.object(
+                server,
+                "_oauth_discovery",
+                return_value={"token_endpoint": "https://auth.x.ai/oauth2/token"},
             ), mock.patch.object(
                 server,
                 "_jwt_is_expiring",
@@ -231,28 +218,83 @@ class OAuthResolutionTests(unittest.TestCase):
 
             self.assertEqual((token, base_url, source), ("fresh", "https://api.x.ai/v1", "xai-oauth"))
             saved = json.loads(auth_path.read_text(encoding="utf-8"))
-            state = saved["providers"]["xai-oauth"]
-            self.assertEqual(state["tokens"]["access_token"], "fresh")
-            self.assertEqual(state["tokens"]["refresh_token"], "refresh2")
+            self.assertEqual(saved["tokens"]["access_token"], "fresh")
+            self.assertEqual(saved["tokens"]["refresh_token"], "refresh2")
             self.assertEqual(
-                state["discovery"]["token_endpoint"],
+                saved["discovery"]["token_endpoint"],
                 "https://auth.x.ai/oauth2/token",
             )
 
+    def test_exchange_code_includes_pkce_challenge_echo(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["body"] = request.data.decode("utf-8")
+            captured["timeout"] = timeout
+            return FakeHTTPResponse(
+                {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                }
+            )
+
+        with mock.patch.object(server.urllib.request, "urlopen", side_effect=fake_urlopen):
+            payload = server._exchange_code_for_tokens(
+                token_endpoint="https://auth.x.ai/oauth2/token",
+                code="code",
+                redirect_uri="http://127.0.0.1:56121/callback",
+                code_verifier="verifier",
+                code_challenge="challenge",
+                timeout_seconds=45,
+            )
+
+        self.assertEqual(payload["access_token"], "access")
+        self.assertEqual(captured["url"], "https://auth.x.ai/oauth2/token")
+        parsed = urllib.parse.parse_qs(captured["body"])
+        self.assertEqual(parsed["grant_type"], ["authorization_code"])
+        self.assertEqual(parsed["code_verifier"], ["verifier"])
+        self.assertEqual(parsed["code_challenge"], ["challenge"])
+        self.assertEqual(parsed["code_challenge_method"], ["S256"])
+
+    def test_auth_tool_reports_existing_api_key_without_browser(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home, "XAI_API_KEY": "key"},
+            clear=True,
+        ), mock.patch.object(server, "_run_xai_oauth_login") as login:
+            result = server.x_search_auth_tool({})
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["credential_source"], "xai-api-key")
+        login.assert_not_called()
+
+    def test_status_uses_codex_x_search_home(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ):
+            result = server.x_search_status_tool({})
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["authenticated"])
+        self.assertEqual(result["auth_store"], str(Path(home) / "auth.json"))
+
 
 class McpProtocolTests(unittest.TestCase):
-    def test_mcp_tools_list_and_error_call(self):
-        with mock.patch.object(server, "check_x_search_requirements", return_value=True):
-            list_response = server._handle_mcp_request(
-                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-            )
-        self.assertEqual(list_response["result"]["tools"][0]["name"], "x_search")
-
-        with mock.patch.object(server, "check_x_search_requirements", return_value=False):
-            hidden_response = server._handle_mcp_request(
-                {"jsonrpc": "2.0", "id": 4, "method": "tools/list"}
-            )
-        self.assertEqual(hidden_response["result"]["tools"], [])
+    def test_mcp_tools_list_always_exposes_search_and_auth(self):
+        response = server._handle_mcp_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        names = [tool["name"] for tool in response["result"]["tools"]]
+        self.assertIn("x_search", names)
+        self.assertIn("x_search_auth", names)
+        self.assertIn("x_search_status", names)
 
         call_response = server._handle_mcp_request(
             {

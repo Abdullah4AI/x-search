@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""MCP server for xAI-backed X Search.
+"""Standalone MCP server for xAI-backed X Search in Codex.
 
-This mirrors Hermes' x_search behavior without depending on Hermes at runtime:
-it reuses Hermes xAI OAuth credentials when available, falls back to XAI_API_KEY,
-calls the xAI Responses API with a server-side {"type": "x_search"} tool, and
-returns citation/degraded metadata in the same shape.
+The server exposes an `x_search` tool that calls xAI's Responses API with the
+server-side {"type": "x_search"} tool. It also owns its own browser-based xAI
+OAuth PKCE sign-in flow, stores tokens in the current user's X Search config
+directory, and never depends on any external agent runtime.
 """
 
 from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import webbrowser
 from datetime import date, datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -29,6 +34,10 @@ DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
 XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+XAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
+XAI_OAUTH_REDIRECT_PORT = 56121
+XAI_OAUTH_REDIRECT_PATH = "/callback"
 DEFAULT_X_SEARCH_MODEL = "grok-4.20-reasoning"
 DEFAULT_X_SEARCH_TIMEOUT_SECONDS = 180
 DEFAULT_X_SEARCH_RETRIES = 2
@@ -38,7 +47,7 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
 MAX_MCP_CONTENT_LENGTH = 5 * 1024 * 1024
 SERVER_NAME = "x-search"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 
 
@@ -88,20 +97,95 @@ X_SEARCH_INPUT_SCHEMA: Dict[str, Any] = {
 }
 
 
+X_SEARCH_AUTH_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "open_browser": {
+            "type": "boolean",
+            "description": "Open the xAI authorization page in the default browser.",
+            "default": True,
+        },
+        "timeout_seconds": {
+            "type": "integer",
+            "minimum": 30,
+            "maximum": 900,
+            "description": "How long to wait for the local browser callback.",
+            "default": 180,
+        },
+        "force": {
+            "type": "boolean",
+            "description": "Start a new sign-in even if a credential already exists.",
+            "default": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+X_SEARCH_STATUS_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+
+X_SEARCH_LOGOUT_INPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+
 X_SEARCH_TOOL: Dict[str, Any] = {
     "name": "x_search",
     "description": (
-        "Search X (Twitter) posts, profiles, and threads using xAI's built-in "
-        "x_search Responses tool. Use this for current discussion, reactions, "
-        "or claims on X rather than general web pages. Requires Hermes xAI "
-        "OAuth credentials or XAI_API_KEY."
+        "Search X posts, profiles, and threads using xAI's built-in x_search "
+        "Responses tool. Use this for current discussion, reactions, or claims "
+        "on X rather than general web pages. If xAI authentication is not set "
+        "up yet, this tool starts the browser sign-in flow automatically."
     ),
     "inputSchema": X_SEARCH_INPUT_SCHEMA,
 }
 
 
+X_SEARCH_AUTH_TOOL: Dict[str, Any] = {
+    "name": "x_search_auth",
+    "description": (
+        "Sign in to xAI for X Search. Opens the browser, waits for the local "
+        "OAuth callback, and stores the resulting token for this user only."
+    ),
+    "inputSchema": X_SEARCH_AUTH_INPUT_SCHEMA,
+}
+
+
+X_SEARCH_STATUS_TOOL: Dict[str, Any] = {
+    "name": "x_search_status",
+    "description": "Check whether X Search has a local xAI credential configured.",
+    "inputSchema": X_SEARCH_STATUS_INPUT_SCHEMA,
+}
+
+
+X_SEARCH_LOGOUT_TOOL: Dict[str, Any] = {
+    "name": "x_search_logout",
+    "description": "Remove this user's locally stored xAI OAuth token for X Search.",
+    "inputSchema": X_SEARCH_LOGOUT_INPUT_SCHEMA,
+}
+
+
+MCP_TOOLS = [
+    X_SEARCH_TOOL,
+    X_SEARCH_AUTH_TOOL,
+    X_SEARCH_STATUS_TOOL,
+    X_SEARCH_LOGOUT_TOOL,
+]
+
+
 class XSearchError(Exception):
-    """Expected x_search error surfaced as a structured tool result."""
+    """Expected X Search error surfaced as a structured tool result."""
+
+
+class XSearchNoCredentialsError(XSearchError):
+    """Raised when xAI credentials are absent or require a fresh sign-in."""
 
 
 class McpProtocolError(Exception):
@@ -115,18 +199,9 @@ def _home() -> Path:
     return Path.home()
 
 
-def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (_home() / ".hermes")).expanduser()
-
-
-def _hermes_agent_path() -> Optional[Path]:
-    raw = os.environ.get("HERMES_AGENT_PATH", "").strip()
-    candidates = [Path(raw).expanduser()] if raw else []
-    candidates.append(_hermes_home() / "hermes-agent")
-    for candidate in candidates:
-        if (candidate / "tools" / "xai_http.py").is_file():
-            return candidate
-    return None
+def _x_search_home() -> Path:
+    configured = os.environ.get("X_SEARCH_HOME", "").strip()
+    return Path(configured or (_home() / ".codex-x-search")).expanduser()
 
 
 def _read_dotenv(path: Path) -> Dict[str, str]:
@@ -160,7 +235,7 @@ def _read_dotenv(path: Path) -> Dict[str, str]:
 
 
 def _env_value(name: str, default: Optional[str] = None) -> Optional[str]:
-    for path in (_hermes_home() / ".env",):
+    for path in (_x_search_home() / ".env",):
         value = _read_dotenv(path).get(name)
         if value is not None and str(value).strip():
             return str(value).strip()
@@ -182,63 +257,40 @@ def _strip_inline_comment(value: str) -> str:
     return value.strip()
 
 
-def _read_hermes_x_search_config() -> Dict[str, str]:
-    hermes_agent = _hermes_agent_path()
-    if hermes_agent and str(hermes_agent) not in sys.path:
-        sys.path.insert(0, str(hermes_agent))
-    if hermes_agent:
-        try:
-            from hermes_cli.config import load_config  # type: ignore
-
-            config = load_config().get("x_search", {}) or {}
-            if isinstance(config, dict):
-                return {str(key): str(value) for key, value in config.items()}
-        except Exception:
-            pass
-
-    path = _hermes_home() / "config.yaml"
+def _read_x_search_config() -> Dict[str, str]:
+    path = _x_search_home() / "config.json"
     if not path.is_file():
         return {}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
         return {}
-
-    config: Dict[str, str] = {}
-    in_section = False
-    section_indent = 0
-    for raw in lines:
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        indent = len(raw) - len(raw.lstrip(" "))
-        stripped = raw.strip()
-        if re.match(r"^x_search\s*:\s*(?:#.*)?$", stripped):
-            in_section = True
-            section_indent = indent
-            continue
-        if in_section and indent <= section_indent and not raw.startswith(" "):
-            break
-        if not in_section or ":" not in stripped:
-            continue
-        key, value = stripped.split(":", 1)
-        key = key.strip()
-        value = _strip_inline_comment(value).strip()
-        if (
-            (value.startswith('"') and value.endswith('"'))
-            or (value.startswith("'") and value.endswith("'"))
-        ):
-            value = value[1:-1]
-        if key and value:
-            config[key] = value
-    return config
+    if not isinstance(payload, dict):
+        return {}
+    config = payload.get("x_search", payload)
+    if not isinstance(config, dict):
+        return {}
+    return {str(key): str(value) for key, value in config.items()}
 
 
 def _x_search_config() -> Dict[str, Any]:
-    hermes_cfg = _read_hermes_x_search_config()
+    cfg = _read_x_search_config()
 
-    model = hermes_cfg.get("model") or DEFAULT_X_SEARCH_MODEL
-    timeout_raw = hermes_cfg.get("timeout_seconds") or str(DEFAULT_X_SEARCH_TIMEOUT_SECONDS)
-    retries_raw = hermes_cfg.get("retries") or str(DEFAULT_X_SEARCH_RETRIES)
+    model = (
+        _env_value("X_SEARCH_MODEL")
+        or cfg.get("model")
+        or DEFAULT_X_SEARCH_MODEL
+    )
+    timeout_raw = (
+        _env_value("X_SEARCH_TIMEOUT_SECONDS")
+        or cfg.get("timeout_seconds")
+        or str(DEFAULT_X_SEARCH_TIMEOUT_SECONDS)
+    )
+    retries_raw = (
+        _env_value("X_SEARCH_RETRIES")
+        or cfg.get("retries")
+        or str(DEFAULT_X_SEARCH_RETRIES)
+    )
 
     try:
         timeout_seconds = max(30, int(str(timeout_raw)))
@@ -279,7 +331,7 @@ def _jwt_is_expiring(access_token: str, skew_seconds: int) -> bool:
 
 
 def _load_auth_store() -> Tuple[Path, Dict[str, Any]]:
-    path = _hermes_home() / "auth.json"
+    path = _x_search_home() / "auth.json"
     if not path.is_file():
         return path, {}
     try:
@@ -291,7 +343,7 @@ def _load_auth_store() -> Tuple[Path, Dict[str, Any]]:
 
 @contextlib.contextmanager
 def _auth_store_lock():
-    lock_path = _hermes_home() / "auth.lock"
+    lock_path = _x_search_home() / "auth.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as handle:
         fcntl_module = None
@@ -327,6 +379,25 @@ def _save_auth_store(path: Path, payload: Dict[str, Any]) -> None:
     except OSError:
         pass
     os.replace(temp_path, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _delete_auth_store() -> bool:
+    auth_path = _x_search_home() / "auth.json"
+    lock_path = _x_search_home() / "auth.lock"
+    removed = False
+    for path in (auth_path, lock_path):
+        try:
+            path.unlink()
+            removed = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    return removed
 
 
 def _xai_endpoint_ok(url: str) -> bool:
@@ -346,7 +417,7 @@ def _validate_base_url(base_url: str, credential_source: str) -> str:
     if _xai_endpoint_ok(stripped):
         return stripped
     allow_custom = str(_env_value("X_SEARCH_ALLOW_CUSTOM_BASE_URL", "") or "").lower()
-    if credential_source == "xai" and allow_custom in {"1", "true", "yes"}:
+    if credential_source == "xai-api-key" and allow_custom in {"1", "true", "yes"}:
         return stripped
     raise XSearchError(
         "Refusing to send xAI bearer to a non-xAI base URL. Set "
@@ -436,8 +507,8 @@ def _refresh_oauth_token(
         detail = _redact(_read_limited(exc, MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip())
         if exc.code == 403:
             raise XSearchError(
-                "xAI token refresh failed with HTTP 403. This OAuth account may "
-                "not be authorized for xAI API access; set XAI_API_KEY as a fallback."
+                "xAI token refresh failed with HTTP 403. This account may not "
+                "be authorized for xAI API access; set XAI_API_KEY as a fallback."
             )
         raise XSearchError(
             f"xAI token refresh failed with HTTP {exc.code}"
@@ -450,30 +521,357 @@ def _refresh_oauth_token(
     return payload
 
 
-def _resolve_with_hermes_runtime(force_refresh: bool = False) -> Optional[Tuple[str, str, str]]:
-    if str(_env_value("X_SEARCH_DISABLE_HERMES_RESOLVER", "") or "").lower() in {"1", "true", "yes"}:
-        return None
-    hermes_agent = _hermes_agent_path()
-    if not hermes_agent:
-        return None
-    if str(hermes_agent) not in sys.path:
-        sys.path.insert(0, str(hermes_agent))
-    try:
-        from tools.xai_http import resolve_xai_http_credentials  # type: ignore
+def _oauth_pkce_code_verifier(length: int = 64) -> str:
+    raw = base64.urlsafe_b64encode(os.urandom(length)).decode("ascii")
+    return raw.rstrip("=")[:128]
 
-        creds = resolve_xai_http_credentials(force_refresh=force_refresh)
-    except Exception:
-        return None
 
-    api_key = str(creds.get("api_key") or "").strip()
-    if not api_key:
-        return None
-    source = str(creds.get("provider") or "xai")
-    base_url = _validate_base_url(
-        str(creds.get("base_url") or DEFAULT_XAI_BASE_URL),
-        source,
+def _oauth_pkce_code_challenge(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _oauth_build_authorize_url(
+    *,
+    authorization_endpoint: str,
+    redirect_uri: str,
+    code_challenge: str,
+    state: str,
+    nonce: str,
+) -> str:
+    authorize_params = {
+        "response_type": "code",
+        "client_id": XAI_OAUTH_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "scope": XAI_OAUTH_SCOPE,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "nonce": nonce,
+        "plan": "generic",
+        "referrer": "codex-x-search",
+    }
+    return f"{authorization_endpoint}?{urllib.parse.urlencode(authorize_params)}"
+
+
+def _callback_cors_origin(origin: Optional[str]) -> str:
+    allowed = {"https://accounts.x.ai", "https://auth.x.ai"}
+    return origin if origin in allowed else ""
+
+
+def _make_callback_handler(expected_path: str) -> Tuple[type[BaseHTTPRequestHandler], Dict[str, Any]]:
+    result: Dict[str, Any] = {
+        "code": None,
+        "state": None,
+        "error": None,
+        "error_description": None,
+    }
+    result_lock = threading.Lock()
+
+    class _XSearchCallbackHandler(BaseHTTPRequestHandler):
+        def _maybe_write_cors_headers(self) -> None:
+            origin = self.headers.get("Origin")
+            allow_origin = _callback_cors_origin(origin)
+            if allow_origin:
+                self.send_header("Access-Control-Allow-Origin", allow_origin)
+                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Vary", "Origin")
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self.send_response(204)
+            self._maybe_write_cors_headers()
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != expected_path:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Not found.")
+                return
+
+            params = urllib.parse.parse_qs(parsed.query)
+            incoming = {
+                "code": params.get("code", [None])[0],
+                "state": params.get("state", [None])[0],
+                "error": params.get("error", [None])[0],
+                "error_description": params.get("error_description", [None])[0],
+            }
+
+            if incoming["code"] is None and incoming["error"] is None:
+                self.send_response(400)
+                self._maybe_write_cors_headers()
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                body = (
+                    "<html><body>"
+                    "<h1>X Search sign-in was not received.</h1>"
+                    "<p>No authorization code was present in this callback URL. "
+                    "Return to Codex and run X Search sign-in again.</p>"
+                    "</body></html>"
+                )
+                self.wfile.write(body.encode("utf-8"))
+                return
+
+            with result_lock:
+                if not (result["code"] or result["error"]):
+                    result.update(incoming)
+
+            self.send_response(200)
+            self._maybe_write_cors_headers()
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            if incoming["error"]:
+                body = "<html><body><h1>xAI authorization failed.</h1>You can close this tab.</body></html>"
+            else:
+                body = "<html><body><h1>xAI authorization received.</h1>You can close this tab.</body></html>"
+            self.wfile.write(body.encode("utf-8"))
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+            return
+
+    return _XSearchCallbackHandler, result
+
+
+def _start_callback_server(
+    preferred_port: int = XAI_OAUTH_REDIRECT_PORT,
+) -> Tuple[ThreadingHTTPServer, threading.Thread, Dict[str, Any], str]:
+    handler_cls, result = _make_callback_handler(XAI_OAUTH_REDIRECT_PATH)
+
+    class _ReuseHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    ports_to_try = [preferred_port]
+    if preferred_port != 0:
+        ports_to_try.append(0)
+    server: Optional[ThreadingHTTPServer] = None
+    last_error: Optional[OSError] = None
+    for port in ports_to_try:
+        try:
+            server = _ReuseHTTPServer((XAI_OAUTH_REDIRECT_HOST, port), handler_cls)
+            break
+        except OSError as exc:
+            last_error = exc
+    if server is None:
+        raise XSearchError(
+            f"Could not bind xAI callback server on {XAI_OAUTH_REDIRECT_HOST}:"
+            f"{preferred_port}: {last_error}"
+        )
+
+    actual_port = int(server.server_address[1])
+    redirect_uri = f"http://{XAI_OAUTH_REDIRECT_HOST}:{actual_port}{XAI_OAUTH_REDIRECT_PATH}"
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.1},
+        daemon=True,
     )
-    return api_key, base_url, source
+    thread.start()
+    return server, thread, result, redirect_uri
+
+
+def _wait_for_callback(
+    server: ThreadingHTTPServer,
+    thread: threading.Thread,
+    result: Dict[str, Any],
+    *,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(30.0, timeout_seconds)
+    try:
+        while time.monotonic() < deadline:
+            if result["code"] or result["error"]:
+                return result
+            time.sleep(0.1)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1.0)
+    raise XSearchError("xAI authorization timed out waiting for the local callback")
+
+
+def _exchange_code_for_tokens(
+    *,
+    token_endpoint: str,
+    code: str,
+    redirect_uri: str,
+    code_verifier: str,
+    code_challenge: str,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
+    if not code_verifier:
+        raise XSearchError(
+            "xAI token exchange refused locally: PKCE code_verifier is empty. "
+            "This is a bug in the X Search plugin."
+        )
+    if not _xai_endpoint_ok(token_endpoint):
+        raise XSearchError("Refusing to send xAI authorization code to a non-xAI endpoint")
+
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": XAI_OAUTH_CLIENT_ID,
+        "code_verifier": code_verifier,
+    }
+    if code_challenge:
+        data["code_challenge"] = code_challenge
+        data["code_challenge_method"] = "S256"
+
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    request = urllib.request.Request(
+        token_endpoint,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": _user_agent(),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(20, timeout_seconds)) as response:
+            payload = _read_json_response(response)
+    except urllib.error.HTTPError as exc:
+        detail = _redact(_read_limited(exc, MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip())
+        if exc.code == 403:
+            raise XSearchError(
+                "xAI token exchange failed with HTTP 403. This account may not "
+                "be authorized for xAI API access; set XAI_API_KEY as a fallback."
+            )
+        raise XSearchError(
+            f"xAI token exchange failed with HTTP {exc.code}"
+            + (f": {detail[:500]}" if detail else "")
+        )
+
+    if not str(payload.get("access_token") or "").strip():
+        raise XSearchError("xAI token exchange response was missing access_token")
+    if not str(payload.get("refresh_token") or "").strip():
+        raise XSearchError("xAI token exchange response was missing refresh_token")
+    return payload
+
+
+def _store_oauth_payload(
+    *,
+    payload: Dict[str, Any],
+    discovery: Dict[str, str],
+    redirect_uri: str,
+    base_url: str,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    auth_store = {
+        "version": 1,
+        "provider": "xai",
+        "auth_mode": "oauth_pkce",
+        "tokens": {
+            "access_token": str(payload.get("access_token") or "").strip(),
+            "refresh_token": str(payload.get("refresh_token") or "").strip(),
+            "id_token": str(payload.get("id_token") or "").strip(),
+            "expires_in": payload.get("expires_in"),
+            "token_type": str(payload.get("token_type") or "Bearer").strip() or "Bearer",
+        },
+        "discovery": discovery,
+        "redirect_uri": redirect_uri,
+        "base_url": base_url,
+        "last_refresh": now,
+    }
+    with _auth_store_lock():
+        auth_path, _ = _load_auth_store()
+        _save_auth_store(auth_path, auth_store)
+    return auth_store
+
+
+def _run_xai_oauth_login(
+    *,
+    timeout_seconds: int,
+    open_browser: bool,
+) -> Dict[str, Any]:
+    discovery = _oauth_discovery(timeout_seconds)
+    server, thread, callback_result, redirect_uri = _start_callback_server()
+    try:
+        code_verifier = _oauth_pkce_code_verifier()
+        code_challenge = _oauth_pkce_code_challenge(code_verifier)
+        state = uuid.uuid4().hex
+        nonce = uuid.uuid4().hex
+        authorize_url = _oauth_build_authorize_url(
+            authorization_endpoint=discovery["authorization_endpoint"],
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            state=state,
+            nonce=nonce,
+        )
+
+        print("Open this URL to authorize X Search with xAI:", file=sys.stderr)
+        print(authorize_url, file=sys.stderr)
+        print(f"Waiting for callback on {redirect_uri}", file=sys.stderr)
+
+        browser_opened = False
+        if open_browser:
+            try:
+                browser_opened = bool(webbrowser.open(authorize_url))
+            except Exception:
+                browser_opened = False
+            if browser_opened:
+                print("Browser opened for xAI authorization.", file=sys.stderr)
+            else:
+                print("Could not open a browser automatically; use the URL above.", file=sys.stderr)
+
+        callback = _wait_for_callback(
+            server,
+            thread,
+            callback_result,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+        try:
+            thread.join(timeout=1.0)
+        except Exception:
+            pass
+        raise
+
+    if callback.get("error"):
+        detail = callback.get("error_description") or callback["error"]
+        raise XSearchError(f"xAI authorization failed: {detail}")
+    if callback.get("state") != state:
+        raise XSearchError("xAI authorization failed: state mismatch")
+    code = str(callback.get("code") or "").strip()
+    if not code:
+        raise XSearchError("xAI authorization failed: missing authorization code")
+
+    payload = _exchange_code_for_tokens(
+        token_endpoint=discovery["token_endpoint"],
+        code=code,
+        redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
+        code_challenge=code_challenge,
+        timeout_seconds=timeout_seconds,
+    )
+    base_url = _validate_base_url(
+        str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_OAUTH_BASE_URL),
+        "xai-oauth",
+    )
+    return _store_oauth_payload(
+        payload=payload,
+        discovery=discovery,
+        redirect_uri=redirect_uri,
+        base_url=base_url,
+    )
+
+
+def _oauth_base_url(stored_base_url: str = "") -> str:
+    override = (
+        _env_value("XAI_BASE_URL")
+        or stored_base_url
+        or DEFAULT_XAI_OAUTH_BASE_URL
+    ).rstrip("/")
+    return _validate_base_url(override, "xai-oauth")
 
 
 def _resolve_oauth_credentials(
@@ -481,17 +879,9 @@ def _resolve_oauth_credentials(
     *,
     force_refresh: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
-    if str(_env_value("X_SEARCH_DISABLE_HERMES_OAUTH", "") or "").lower() in {"1", "true", "yes"}:
-        return None
-
     with _auth_store_lock():
         auth_path, auth_store = _load_auth_store()
-        providers = auth_store.get("providers") if isinstance(auth_store, dict) else None
-        state = providers.get("xai-oauth") if isinstance(providers, dict) else None
-        if not isinstance(state, dict):
-            return None
-
-        tokens = state.get("tokens")
+        tokens = auth_store.get("tokens") if isinstance(auth_store, dict) else None
         if not isinstance(tokens, dict):
             return None
 
@@ -502,12 +892,12 @@ def _resolve_oauth_credentials(
             XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
         )
         if access_token and not should_refresh:
-            return access_token, _oauth_base_url(), "xai-oauth"
+            return access_token, _oauth_base_url(str(auth_store.get("base_url") or "")), "xai-oauth"
 
         if not refresh_token:
             return None
 
-        discovery = state.get("discovery") if isinstance(state.get("discovery"), dict) else {}
+        discovery = auth_store.get("discovery") if isinstance(auth_store.get("discovery"), dict) else {}
         updated_discovery = dict(discovery)
         token_endpoint = str(updated_discovery.get("token_endpoint") or "").strip()
         if not token_endpoint:
@@ -525,21 +915,12 @@ def _resolve_oauth_credentials(
         if refreshed.get("token_type"):
             updated_tokens["token_type"] = str(refreshed.get("token_type") or "Bearer").strip() or "Bearer"
 
-        state["tokens"] = updated_tokens
-        state["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        state["auth_mode"] = "oauth_pkce"
-        state["discovery"] = updated_discovery
+        auth_store["tokens"] = updated_tokens
+        auth_store["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        auth_store["auth_mode"] = "oauth_pkce"
+        auth_store["discovery"] = updated_discovery
         _save_auth_store(auth_path, auth_store)
-        return updated_tokens["access_token"], _oauth_base_url(), "xai-oauth"
-
-
-def _oauth_base_url() -> str:
-    override = (
-        _env_value("HERMES_XAI_BASE_URL")
-        or _env_value("XAI_BASE_URL")
-        or DEFAULT_XAI_OAUTH_BASE_URL
-    ).rstrip("/")
-    return _validate_base_url(override, "xai-oauth")
+        return updated_tokens["access_token"], _oauth_base_url(str(auth_store.get("base_url") or "")), "xai-oauth"
 
 
 def _resolve_xai_credentials(
@@ -547,27 +928,52 @@ def _resolve_xai_credentials(
     *,
     force_refresh: bool = False,
 ) -> Tuple[str, str, str]:
-    hermes = _resolve_with_hermes_runtime(force_refresh=force_refresh)
-    if hermes:
-        return hermes
-
+    oauth_error: Optional[XSearchError] = None
     try:
         oauth = _resolve_oauth_credentials(timeout_seconds, force_refresh=force_refresh)
         if oauth:
             return oauth
-    except XSearchError:
-        # Keep Hermes parity: OAuth is preferred when usable, but an API key can
-        # still rescue a tier-denied or stale OAuth setup.
-        pass
+    except XSearchError as exc:
+        oauth_error = exc
 
     api_key = str(_env_value("XAI_API_KEY") or "").strip()
-    if not api_key:
-        raise XSearchError(
-            "No xAI credentials available. Reuse Hermes OAuth with "
-            "`hermes auth add xai-oauth`, or set XAI_API_KEY."
-        )
-    base_url = _validate_base_url(str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL), "xai")
-    return api_key, base_url, "xai"
+    if api_key:
+        base_url = _validate_base_url(str(_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL), "xai-api-key")
+        return api_key, base_url, "xai-api-key"
+
+    if oauth_error:
+        raise XSearchNoCredentialsError(
+            f"xAI sign-in needs to be refreshed: {oauth_error}"
+        ) from oauth_error
+    raise XSearchNoCredentialsError(
+        "No xAI credentials are configured for X Search."
+    )
+
+
+def _auto_auth_enabled() -> bool:
+    value = str(_env_value("X_SEARCH_AUTO_AUTH", "1") or "1").lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _ensure_xai_credentials(
+    timeout_seconds: int,
+    *,
+    force_refresh: bool = False,
+    interactive: bool = False,
+) -> Tuple[str, str, str]:
+    try:
+        return _resolve_xai_credentials(timeout_seconds, force_refresh=force_refresh)
+    except XSearchNoCredentialsError as exc:
+        if not interactive or not _auto_auth_enabled():
+            raise
+        auth_timeout = max(180, timeout_seconds)
+        try:
+            _run_xai_oauth_login(timeout_seconds=auth_timeout, open_browser=True)
+        except XSearchError as auth_exc:
+            raise XSearchNoCredentialsError(
+                f"xAI authentication was not completed: {auth_exc}"
+            ) from auth_exc
+        return _resolve_xai_credentials(timeout_seconds, force_refresh=force_refresh)
 
 
 def check_x_search_requirements() -> bool:
@@ -599,11 +1005,31 @@ def _normalize_handles(value: Any, field_name: str) -> List[str]:
     return cleaned
 
 
-def _bool_arg(arguments: Dict[str, Any], field_name: str) -> bool:
-    value = arguments.get(field_name, False)
+def _bool_arg(arguments: Dict[str, Any], field_name: str, default: bool = False) -> bool:
+    value = arguments.get(field_name, default)
     if isinstance(value, bool):
         return value
     raise XSearchError(f"{field_name} must be a boolean")
+
+
+def _int_arg(
+    arguments: Dict[str, Any],
+    field_name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = arguments.get(field_name, default)
+    if isinstance(value, bool):
+        raise XSearchError(f"{field_name} must be an integer")
+    try:
+        parsed = int(value)
+    except Exception as exc:
+        raise XSearchError(f"{field_name} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise XSearchError(f"{field_name} must be between {minimum} and {maximum}")
+    return parsed
 
 
 def _parse_iso_date(value: str, field_name: str) -> date:
@@ -677,16 +1103,6 @@ def _extract_inline_citations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _user_agent() -> str:
-    hermes_agent = _hermes_agent_path()
-    if hermes_agent and str(hermes_agent) not in sys.path:
-        sys.path.insert(0, str(hermes_agent))
-    if hermes_agent:
-        try:
-            from tools.xai_http import hermes_xai_user_agent  # type: ignore
-
-            return str(hermes_xai_user_agent())
-        except Exception:
-            pass
     return f"Codex-X-Search/{SERVER_VERSION}"
 
 
@@ -723,6 +1139,88 @@ def _post_json(
         return _read_json_response(response)
 
 
+def x_search_auth_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_keys = set(X_SEARCH_AUTH_INPUT_SCHEMA["properties"])
+    unknown_keys = sorted(set(arguments) - allowed_keys)
+    if unknown_keys:
+        raise XSearchError(f"unknown x_search_auth argument(s): {', '.join(unknown_keys)}")
+
+    force = _bool_arg(arguments, "force", False)
+    open_browser = _bool_arg(arguments, "open_browser", True)
+    timeout_seconds = _int_arg(
+        arguments,
+        "timeout_seconds",
+        default=180,
+        minimum=30,
+        maximum=900,
+    )
+
+    if not force:
+        try:
+            token, base_url, source = _resolve_xai_credentials(timeout_seconds)
+            if token:
+                return {
+                    "success": True,
+                    "provider": "xai",
+                    "tool": "x_search_auth",
+                    "authenticated": True,
+                    "credential_source": source,
+                    "base_url": base_url,
+                    "message": "X Search is already authenticated.",
+                }
+        except XSearchNoCredentialsError:
+            pass
+
+    auth_store = _run_xai_oauth_login(
+        timeout_seconds=timeout_seconds,
+        open_browser=open_browser,
+    )
+    return {
+        "success": True,
+        "provider": "xai",
+        "tool": "x_search_auth",
+        "authenticated": True,
+        "credential_source": "xai-oauth",
+        "base_url": auth_store.get("base_url") or DEFAULT_XAI_OAUTH_BASE_URL,
+        "message": "xAI sign-in completed for X Search.",
+    }
+
+
+def x_search_status_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if arguments:
+        raise XSearchError("x_search_status does not accept arguments")
+    auth_path, auth_store = _load_auth_store()
+    tokens = auth_store.get("tokens") if isinstance(auth_store, dict) else None
+    has_oauth = bool(
+        isinstance(tokens, dict)
+        and str(tokens.get("access_token") or "").strip()
+    )
+    has_api_key = bool(str(_env_value("XAI_API_KEY") or "").strip())
+    return {
+        "success": True,
+        "provider": "xai",
+        "tool": "x_search_status",
+        "authenticated": bool(has_oauth or has_api_key),
+        "oauth_configured": has_oauth,
+        "api_key_configured": has_api_key,
+        "credential_source": "xai-oauth" if has_oauth else "xai-api-key" if has_api_key else None,
+        "auth_store": str(auth_path),
+    }
+
+
+def x_search_logout_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if arguments:
+        raise XSearchError("x_search_logout does not accept arguments")
+    removed = _delete_auth_store()
+    return {
+        "success": True,
+        "provider": "xai",
+        "tool": "x_search_logout",
+        "removed": removed,
+        "message": "Removed stored xAI OAuth credentials for X Search." if removed else "No stored xAI OAuth credentials were present.",
+    }
+
+
 def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     allowed_keys = set(X_SEARCH_INPUT_SCHEMA["properties"])
     unknown_keys = sorted(set(arguments) - allowed_keys)
@@ -747,7 +1245,7 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     enable_image_understanding = _bool_arg(arguments, "enable_image_understanding")
     enable_video_understanding = _bool_arg(arguments, "enable_video_understanding")
 
-    api_key, base_url, source = _resolve_xai_credentials(timeout_seconds)
+    api_key, base_url, source = _ensure_xai_credentials(timeout_seconds, interactive=True)
 
     tool_def: Dict[str, Any] = {"type": "x_search"}
     if allowed:
@@ -790,9 +1288,10 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
             break
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and source == "xai-oauth" and not force_refreshed:
-                api_key, base_url, source = _resolve_xai_credentials(
+                api_key, base_url, source = _ensure_xai_credentials(
                     timeout_seconds,
                     force_refresh=True,
+                    interactive=True,
                 )
                 headers["Authorization"] = f"Bearer {api_key}"
                 force_refreshed = True
@@ -871,11 +1370,11 @@ def x_search_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_error(message: str, error_type: str = "XSearchError") -> Dict[str, Any]:
+def _tool_error(tool_name: str, message: str, error_type: str = "XSearchError") -> Dict[str, Any]:
     return {
         "success": False,
         "provider": "xai",
-        "tool": "x_search",
+        "tool": tool_name,
         "error": message,
         "error_type": error_type,
     }
@@ -964,6 +1463,19 @@ def _mcp_error(request_id: Any, code: int, message: str) -> Dict[str, Any]:
     }
 
 
+def _call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    handlers = {
+        "x_search": x_search_tool,
+        "x_search_auth": x_search_auth_tool,
+        "x_search_status": x_search_status_tool,
+        "x_search_logout": x_search_logout_tool,
+    }
+    handler = handlers.get(name)
+    if handler is None:
+        raise KeyError(name)
+    return handler(arguments)
+
+
 def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(message, dict):
         return _mcp_error(None, -32600, "Invalid Request")
@@ -994,20 +1506,19 @@ def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _mcp_result(request_id, {})
 
     if method == "tools/list":
-        tools = [X_SEARCH_TOOL] if check_x_search_requirements() else []
-        return _mcp_result(request_id, {"tools": tools})
+        return _mcp_result(request_id, {"tools": MCP_TOOLS})
 
     if method == "tools/call":
         name = str(params.get("name") or "")
         arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-        if name != "x_search":
-            return _mcp_error(request_id, -32602, f"Unknown tool: {name}")
         try:
-            result = x_search_tool(arguments)
+            result = _call_tool(name, arguments)
+        except KeyError:
+            return _mcp_error(request_id, -32602, f"Unknown tool: {name}")
         except XSearchError as exc:
-            result = _tool_error(str(exc))
+            result = _tool_error(name, str(exc))
         except Exception as exc:
-            result = _tool_error(str(exc), type(exc).__name__)
+            result = _tool_error(name, str(exc), type(exc).__name__)
         return _mcp_result(
             request_id,
             {
@@ -1028,7 +1539,38 @@ def _handle_mcp_request(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return _mcp_error(request_id, -32601, f"Method not found: {method}")
 
 
+def _run_cli_auth(argv: List[str]) -> int:
+    force = "--force" in argv
+    no_browser = "--no-browser" in argv
+    timeout_seconds = 180
+    for index, item in enumerate(argv):
+        if item == "--timeout" and index + 1 < len(argv):
+            try:
+                timeout_seconds = int(argv[index + 1])
+            except ValueError:
+                print("--timeout must be an integer", file=sys.stderr)
+                return 2
+    try:
+        if force:
+            _delete_auth_store()
+        result = x_search_auth_tool(
+            {
+                "open_browser": not no_browser,
+                "timeout_seconds": timeout_seconds,
+                "force": force,
+            }
+        )
+    except XSearchError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in {"auth", "login", "auth-add"}:
+        return _run_cli_auth(sys.argv[2:])
+
     while True:
         try:
             read_result = _read_mcp_message()
