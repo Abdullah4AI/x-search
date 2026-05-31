@@ -100,9 +100,18 @@ X_SEARCH_INPUT_SCHEMA: Dict[str, Any] = {
 X_SEARCH_AUTH_INPUT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
+        "allow_redirect": {
+            "type": "boolean",
+            "description": (
+                "Explicit user permission to open the xAI authorization page. "
+                "When false and no credential exists, the tool returns a "
+                "permission prompt instead of opening a browser."
+            ),
+            "default": False,
+        },
         "open_browser": {
             "type": "boolean",
-            "description": "Open the xAI authorization page in the default browser.",
+            "description": "Open the xAI authorization page in the default browser after permission is granted.",
             "default": True,
         },
         "timeout_seconds": {
@@ -151,7 +160,9 @@ X_SEARCH_TOOL: Dict[str, Any] = {
 X_SEARCH_AUTH_TOOL: Dict[str, Any] = {
     "name": "x_search_auth",
     "description": (
-        "Sign in to xAI for X Search. Opens the browser, waits for the local "
+        "Sign in to xAI for X Search. Checks existing access first. If no "
+        "credential exists, returns a permission prompt unless allow_redirect "
+        "is true; after permission, opens the browser, waits for the local "
         "OAuth callback, and stores the resulting token for this user only."
     ),
     "inputSchema": X_SEARCH_AUTH_INPUT_SCHEMA,
@@ -170,6 +181,12 @@ X_SEARCH_LOGOUT_TOOL: Dict[str, Any] = {
     "description": "Remove this user's locally stored xAI OAuth token for X Search.",
     "inputSchema": X_SEARCH_LOGOUT_INPUT_SCHEMA,
 }
+
+
+X_SEARCH_AUTH_PERMISSION_MESSAGE = (
+    "X Search needs to open the xAI authentication page to complete sign-in. "
+    "Do you want to allow this?"
+)
 
 
 SETUP_TOOLS = [
@@ -1124,6 +1141,7 @@ def x_search_auth_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
     if unknown_keys:
         raise XSearchError(f"unknown x_search_auth argument(s): {', '.join(unknown_keys)}")
 
+    allow_redirect = _bool_arg(arguments, "allow_redirect", False)
     force = _bool_arg(arguments, "force", False)
     open_browser = _bool_arg(arguments, "open_browser", True)
     timeout_seconds = _int_arg(
@@ -1149,6 +1167,24 @@ def x_search_auth_tool(arguments: Dict[str, Any]) -> Dict[str, Any]:
                 }
         except XSearchNoCredentialsError:
             pass
+
+    if not allow_redirect:
+        return {
+            "success": True,
+            "provider": "xai",
+            "tool": "x_search_auth",
+            "authenticated": False,
+            "permission_required": True,
+            "permission_prompt": X_SEARCH_AUTH_PERMISSION_MESSAGE,
+            "allow_tool": "x_search_auth",
+            "allow_arguments": {
+                "allow_redirect": True,
+                "open_browser": open_browser,
+                "timeout_seconds": timeout_seconds,
+                "force": force,
+            },
+            "message": X_SEARCH_AUTH_PERMISSION_MESSAGE,
+        }
 
     auth_store = _run_xai_oauth_login(
         timeout_seconds=timeout_seconds,
@@ -1378,6 +1414,10 @@ def _auth_required_error(tool_name: str, message: str) -> Dict[str, Any]:
     result = _tool_error(tool_name, message, "XSearchNoCredentialsError")
     result["auth_required"] = True
     result["auth_tool"] = "x_search_auth"
+    result["permission_required"] = True
+    result["permission_prompt"] = X_SEARCH_AUTH_PERMISSION_MESSAGE
+    result["allow_tool"] = "x_search_auth"
+    result["allow_arguments"] = {"allow_redirect": True}
     return result
 
 
@@ -1559,6 +1599,7 @@ def _run_cli_auth(argv: List[str]) -> int:
             _delete_auth_store()
         result = x_search_auth_tool(
             {
+                "allow_redirect": True,
                 "open_browser": not no_browser,
                 "timeout_seconds": timeout_seconds,
                 "force": force,

@@ -332,7 +332,47 @@ class OAuthResolutionTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["authenticated"])
         self.assertEqual(result["credential_source"], "xai")
+        self.assertNotIn("permission_required", result)
         login.assert_not_called()
+
+    def test_auth_tool_requires_permission_before_opening_browser(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ), mock.patch.object(server, "_run_xai_oauth_login") as login:
+            result = server.x_search_auth_tool({})
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["authenticated"])
+        self.assertTrue(result["permission_required"])
+        self.assertEqual(result["permission_prompt"], server.X_SEARCH_AUTH_PERMISSION_MESSAGE)
+        self.assertEqual(result["allow_tool"], "x_search_auth")
+        self.assertTrue(result["allow_arguments"]["allow_redirect"])
+        login.assert_not_called()
+
+    def test_auth_tool_opens_browser_after_permission(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ), mock.patch.object(
+            server,
+            "_run_xai_oauth_login",
+            return_value={"base_url": "https://api.x.ai/v1"},
+        ) as login:
+            result = server.x_search_auth_tool(
+                {
+                    "allow_redirect": True,
+                    "open_browser": True,
+                    "timeout_seconds": 45,
+                }
+            )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["credential_source"], "xai-oauth")
+        login.assert_called_once_with(timeout_seconds=45, open_browser=True)
 
     def test_status_uses_codex_x_search_home(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(
@@ -445,6 +485,30 @@ class McpProtocolTests(unittest.TestCase):
         body = json.loads(call_response["result"]["content"][0]["text"])
         self.assertTrue(body["auth_required"])
         self.assertEqual(body["auth_tool"], "x_search_auth")
+        self.assertTrue(body["permission_required"])
+        self.assertEqual(body["permission_prompt"], server.X_SEARCH_AUTH_PERMISSION_MESSAGE)
+        self.assertEqual(body["allow_arguments"], {"allow_redirect": True})
+
+    def test_mcp_auth_call_prompts_before_redirect(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {"X_SEARCH_HOME": home},
+            clear=True,
+        ), mock.patch.object(server, "_run_xai_oauth_login") as login:
+            call_response = server._handle_mcp_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "x_search_auth", "arguments": {}},
+                }
+            )
+        self.assertFalse(call_response["result"]["isError"])
+        body = json.loads(call_response["result"]["content"][0]["text"])
+        self.assertFalse(body["authenticated"])
+        self.assertTrue(body["permission_required"])
+        self.assertEqual(body["message"], server.X_SEARCH_AUTH_PERMISSION_MESSAGE)
+        login.assert_not_called()
 
     def test_mcp_content_length_round_trip(self):
         original_stdin = sys.stdin

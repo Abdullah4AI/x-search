@@ -1,6 +1,6 @@
 {
   "name": "x-search",
-  "version": "0.2.0+codex.20260531134518",
+  "version": "0.2.0+codex.20260531140112",
   "description": "Search X posts and threads from Codex through xAI's built-in x_search Responses tool.",
   "author": {
     "name": "Abdullah Alrashoudi"

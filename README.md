@@ -25,14 +25,22 @@ The plugin resolves credentials in this order:
 3. `XAI_API_KEY` from the current process environment
 
 Before using `x_search`, check authentication with `x_search_status`. If the
-user is not authenticated, ask them to authenticate with `x_search_auth` first.
-After authentication completes, Codex can use `x_search`.
+user is already authenticated, Codex can use `x_search` immediately. If the
+user is not authenticated, call `x_search_auth` without `allow_redirect`; the
+tool returns a permission prompt and does not open a browser. Only after the
+user allows the redirect should Codex call `x_search_auth` again with
+`{"allow_redirect": true}`.
 
 The `x_search_auth` tool:
 
-1. It starts a temporary callback server on `127.0.0.1`.
-2. It opens the xAI authorization page in your default browser.
-3. After you approve access, it stores the token locally for your user only.
+1. It first verifies whether a valid credential already exists.
+2. If no credential exists and `allow_redirect` is not true, it returns:
+   `X Search needs to open the xAI authentication page to complete sign-in. Do
+   you want to allow this?`
+3. After the user allows the redirect, it starts a temporary callback server on
+   `127.0.0.1`.
+4. It opens the xAI authorization page in your default browser.
+5. After you approve access, it stores the token locally for your user only.
 
 You can also sign in from a terminal:
 
@@ -110,7 +118,8 @@ and `query`.
 
 Additional MCP tools:
 
-- `x_search_auth`: opens the xAI sign-in flow and stores a local token
+- `x_search_auth`: checks existing access, asks permission before opening the
+  xAI sign-in page, and stores a local token after authorization
 - `x_search_status`: reports whether this user has a local credential
 - `x_search_logout`: removes the stored OAuth token for this user
 
