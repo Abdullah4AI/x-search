@@ -35,6 +35,9 @@
       "Find recent posts from @xai",
       "Summarize an X thread with citations"
     ],
-    "brandColor": "#111111"
+    "brandColor": "#111111",
+    "composerIcon": "./assets/x-search-small.svg",
+    "logo": "./assets/app-icon.png",
+    "screenshots": []
   }
 }
