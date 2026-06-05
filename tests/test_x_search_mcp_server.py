@@ -23,10 +23,20 @@ class PluginPackageTests(unittest.TestCase):
         config = json.loads((PLUGIN_ROOT / ".mcp.json").read_text(encoding="utf-8"))
         server_config = config["mcpServers"]["x-search"]
 
-        self.assertEqual(server_config["command"], "python3")
-        self.assertEqual(server_config["args"], ["-u", "scripts/x_search_mcp_server.py"])
+        self.assertEqual(server_config["command"], "node")
+        self.assertEqual(server_config["args"], ["scripts/x_search_mcp_launcher.js"])
         self.assertEqual(server_config["cwd"], ".")
         self.assertEqual(server_config["env"], {})
+
+    def test_mcp_launcher_is_packaged_and_checks_common_python_names(self):
+        launcher_path = PLUGIN_ROOT / "scripts" / "x_search_mcp_launcher.js"
+        launcher = launcher_path.read_text(encoding="utf-8")
+
+        self.assertTrue(launcher_path.is_file())
+        self.assertIn('"python3"', launcher)
+        self.assertIn('"python"', launcher)
+        self.assertIn('"py"', launcher)
+        self.assertIn("x_search_mcp_server.py", launcher)
 
 
 class FakeHTTPResponse:

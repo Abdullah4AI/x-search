@@ -24,6 +24,17 @@ The repository root contains `.agents/plugins/marketplace.json`, and the plugin
 itself lives at `plugins/x-search`, which is the layout Codex expects for a Git
 marketplace.
 
+### Windows compatibility
+
+X Search is implemented in Python, but Codex starts it through a small Node.js
+launcher so Windows installs are not forced to have a `python3` command. The
+launcher tries `py -3`, `py`, `python`, and `python3` on Windows, and
+`python3` then `python` on macOS/Linux. It starts the MCP server with the first
+Python 3.9+ runtime it finds. If Codex installs the plugin but
+`x_search_status` and `x_search` do not appear, install Python 3.9 or newer from
+https://www.python.org/downloads/ and make sure the Python launcher is on your
+PATH.
+
 ## Features
 
 - Search X posts, profiles, and threads from Codex
@@ -68,6 +79,14 @@ You can also sign in from a terminal:
 
 ```bash
 python3 plugins/x-search/scripts/x_search_mcp_server.py auth
+```
+
+On Windows, use one of these forms if `python3` is not available:
+
+```powershell
+py -3 plugins/x-search/scripts/x_search_mcp_server.py auth
+python plugins/x-search/scripts/x_search_mcp_server.py auth
+node plugins/x-search/scripts/x_search_mcp_launcher.js auth
 ```
 
 Tokens are stored outside the plugin repository in `~/.codex-x-search/auth.json`
@@ -163,7 +182,10 @@ Run the local test suite with:
 python3 -m unittest discover -s tests -v
 ```
 
+On Windows, use `py -3 -m unittest discover -s tests -v` or
+`python -m unittest discover -s tests -v` if `python3` is not on PATH.
+
 The tests cover the xAI Responses payload shape, filter/date validation,
 degraded-result signaling, latest-post query hinting, cert-aware HTTPS calls,
 standalone OAuth refresh persistence, browser sign-in tool wiring, and MCP
-`tools/list` / `tools/call` behavior.
+`tools/list` / `tools/call` behavior, plus the cross-platform launcher contract.

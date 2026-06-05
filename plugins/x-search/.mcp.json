@@ -1,10 +1,9 @@
 {
   "mcpServers": {
     "x-search": {
-      "command": "python3",
+      "command": "node",
       "args": [
-        "-u",
-        "scripts/x_search_mcp_server.py"
+        "scripts/x_search_mcp_launcher.js"
       ],
       "cwd": ".",
       "env": {}
